@@ -1,0 +1,41 @@
+# GCP Infrastructure Manager Deployment Configuration
+# This file defines how to deploy the IAM module via Infrastructure Manager
+
+# Basic deployment configuration
+deployment:
+  name: "iam-deployment"
+  location: "us-central1"
+
+# Service account for deployment (optional, uses default if not specified)
+# serviceAccount: "infra-manager@your-project-id.iam.gserviceaccount.com"
+
+# Terraform configuration source
+terraformConfig:
+  # Option 1: Local source (for testing)
+  # source: "."
+
+  # Option 2: Git repository source (recommended for production)
+  gitSource:
+    repository: "https://github.com/KahBrightTech/Cognitech-GCP-Infrastructure-Manager-repo"
+    ref: "main"
+    subpath: "Infrastructure-Manger/deployments"
+
+# Input variables (can also be provided via tfvars file)
+# inputVariables:
+#   project_id:
+#     type: "string"
+#     value: "your-project-id"
+#   region:
+#     type: "string"
+#     value: "us-central1"
+
+# Labels for organization
+labels:
+  environment: "production"
+  managed-by: "infrastructure-manager"
+  module: "iam"
+
+# Annotations for additional metadata
+annotations:
+  team: "platform"
+  cost-center: "engineering"

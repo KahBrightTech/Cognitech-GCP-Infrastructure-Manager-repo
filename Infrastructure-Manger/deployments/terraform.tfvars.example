@@ -1,0 +1,46 @@
+# Example terraform.tfvars for Infrastructure Manager Deployment
+# Copy this file to terraform.tfvars and customize
+
+# Required: Your GCP Project ID
+project_id = "your-project-id"
+
+# Optional: Region for provider configuration
+region = "us-central1"
+
+# Example: Create service accounts
+service_accounts = {
+  "app-backend" = {
+    display_name = "Application Backend"
+    description  = "Backend service account"
+  }
+  "ci-cd-pipeline" = {
+    display_name = "CI/CD Pipeline"
+    description  = "For automated deployments"
+  }
+}
+
+# Example: Grant IAM roles (additive - safe for shared management)
+project_iam_members = {
+  "backend-storage-viewer" = {
+    role   = "roles/storage.objectViewer"
+    member = "serviceAccount:app-backend@your-project-id.iam.gserviceaccount.com"
+  }
+  "cicd-editor" = {
+    role   = "roles/editor"
+    member = "serviceAccount:ci-cd-pipeline@your-project-id.iam.gserviceaccount.com"
+  }
+}
+
+# Example: Create custom role
+custom_roles = {
+  "customDeployer" = {
+    title       = "Custom Deployer"
+    description = "Can deploy applications"
+    permissions = [
+      "compute.instances.create",
+      "compute.instances.start",
+      "storage.objects.create"
+    ]
+    stage = "GA"
+  }
+}
