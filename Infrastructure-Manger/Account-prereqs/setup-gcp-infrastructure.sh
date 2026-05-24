@@ -407,8 +407,43 @@ if [ "$ACTION" = "2" ]; then
 fi
 
 # ============================================================================
-# HELPER FUNCTIONS: Resource Discovery
+# HELPER FUNCTIONS: Resource Discovery and Retry Logic
 # ============================================================================
+retry_with_backoff() {
+    local max_retries=3
+    local base_delay=5
+    local operation=$1
+    shift
+    local command=("$@")
+    
+    for ((attempt=1; attempt<=max_retries; attempt++)); do
+        output=$("${command[@]}" 2>&1)
+        exit_code=$?
+        
+        if [ $exit_code -eq 0 ]; then
+            echo "$output"
+            return 0
+        fi
+        
+        # Check if it's a rate limit error
+        if echo "$output" | grep -qE "429|RATE_LIMIT_EXCEEDED|Quota exceeded"; then
+            if [ $attempt -lt $max_retries ]; then
+                delay=$((base_delay * (2 ** (attempt - 1))))
+                print_warning "Rate limit hit. Waiting $delay seconds before retry $attempt of $max_retries..."
+                sleep $delay
+            else
+                print_error "Max retries reached for $operation"
+                echo "$output"
+                return $exit_code
+            fi
+        else
+            # Non-rate-limit error, don't retry
+            echo "$output"
+            return $exit_code
+        fi
+    done
+}
+
 get_existing_folders() {
     local ORG_ID=$1
     gcloud resource-manager folders list --organization="$ORG_ID" --format="value(name,displayName)" 2>/dev/null | grep '^[0-9]'
@@ -417,6 +452,60 @@ get_existing_folders() {
 get_folder_projects() {
     local FOLDER_ID=$1
     gcloud projects list --filter="parent.id=$FOLDER_ID" --format="value(projectId,name)" 2>/dev/null | grep '^[a-z]'
+}
+
+check_project_resources() {
+    local PROJECT_ID=$1
+    local BILLING_ACCOUNT=$2
+    local REGION=$3
+    local ISSUES=""
+    local BUCKET_NAME=""
+    
+    # Check billing
+    local BILLING_INFO=$(gcloud billing projects describe "$PROJECT_ID" --format="value(billingAccountName)" 2>/dev/null)
+    if [ -z "$BILLING_INFO" ]; then
+        ISSUES="${ISSUES}billing "
+    fi
+    
+    # Check for Infrastructure Manager service account
+    local SA_EMAIL="infra-manager-sa@$PROJECT_ID.iam.gserviceaccount.com"
+    local SA_EXISTS=$(gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" --format="value(email)" 2>/dev/null)
+    if [ -z "$SA_EXISTS" ]; then
+        ISSUES="${ISSUES}service-account "
+    else
+        # Check if service account has required roles
+        local SA_ROLES=$(gcloud projects get-iam-policy "$PROJECT_ID" --flatten="bindings[].members" --filter="bindings.members:serviceAccount:$SA_EMAIL" --format="value(bindings.role)" 2>/dev/null)
+        local REQUIRED_ROLES=("roles/editor" "roles/storage.admin" "roles/iam.serviceAccountUser")
+        for ROLE in "${REQUIRED_ROLES[@]}"; do
+            if ! echo "$SA_ROLES" | grep -q "$ROLE"; then
+                ISSUES="${ISSUES}service-account-roles "
+                break
+            fi
+        done
+    fi
+    
+    # Check for state bucket
+    local BUCKETS=$(gcloud storage buckets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null | grep "$PROJECT_ID.*state" | head -n1)
+    
+    if [ -z "$BUCKETS" ]; then
+        ISSUES="${ISSUES}bucket "
+    else
+        BUCKET_NAME="$BUCKETS"
+        
+        # Check versioning
+        local VERSIONING=$(gcloud storage buckets describe "gs://$BUCKET_NAME" --format="value(versioning.enabled)" 2>/dev/null)
+        if [ "$VERSIONING" != "True" ]; then
+            ISSUES="${ISSUES}versioning "
+        fi
+        
+        # Check lifecycle
+        local LIFECYCLE=$(gcloud storage buckets describe "gs://$BUCKET_NAME" --format="json" 2>/dev/null | grep -o '"lifecycle"')
+        if [ -z "$LIFECYCLE" ]; then
+            ISSUES="${ISSUES}lifecycle "
+        fi
+    fi
+    
+    echo "$ISSUES|$BUCKET_NAME"
 }
 
 # ============================================================================
@@ -581,15 +670,214 @@ for FOLDER in "${FOLDERS[@]}"; do
             echo -e "${YELLOW}  Existing projects in '$FOLDER':${NC}"
             echo -e "  ${GRAY}─────────────────────────────────────────────────${NC}"
             
+            # Store projects with issues
+            declare -a PROJECTS_WITH_ISSUES_IDS=()
+            declare -a PROJECTS_WITH_ISSUES_NAMES=()
+            declare -a PROJECTS_WITH_ISSUES_DETAILS=()
+            declare -a PROJECTS_WITH_ISSUES_BUCKETS=()
+            
             IDX=1
             while IFS=$'\t' read -r PROJ_ID PROJ_NAME; do
                 echo -e "    ${WHITE}[$IDX] $PROJ_NAME${NC}"
                 echo -e "        ${GRAY}ID: $PROJ_ID${NC}"
+                
+                # Check project resources
+                VALIDATION=$(check_project_resources "$PROJ_ID" "$BILLING_ACCOUNT" "$REGION")
+                ISSUES=$(echo "$VALIDATION" | cut -d'|' -f1)
+                BUCKET=$(echo "$VALIDATION" | cut -d'|' -f2)
+                
+                if [ -n "$ISSUES" ] && [ "$ISSUES" != " " ]; then
+                    PROJECTS_WITH_ISSUES_IDS+=("$PROJ_ID")
+                    PROJECTS_WITH_ISSUES_NAMES+=("$PROJ_NAME")
+                    PROJECTS_WITH_ISSUES_DETAILS+=("$ISSUES")
+                    PROJECTS_WITH_ISSUES_BUCKETS+=("$BUCKET")
+                    echo -e "        ${YELLOW}⚠️  Missing: $ISSUES${NC}"
+                else
+                    echo -e "        ${GREEN}✓ Complete${NC}"
+                fi
                 ((IDX++))
             done <<< "$EXISTING_PROJECTS_LIST"
             
             echo -e "  ${GRAY}─────────────────────────────────────────────────${NC}"
             echo ""
+            
+            # Offer to fix missing resources
+            if [ ${#PROJECTS_WITH_ISSUES_IDS[@]} -gt 0 ]; then
+                print_warning "Found ${#PROJECTS_WITH_ISSUES_IDS[@]} project(s) with missing resources."
+                read -p "Would you like to fix missing resources for existing projects? (y/n): " FIX_MISSING
+                
+                if [ "$FIX_MISSING" = "y" ]; then
+                    for IDX in "${!PROJECTS_WITH_ISSUES_IDS[@]}"; do
+                        PROJ_ID="${PROJECTS_WITH_ISSUES_IDS[$IDX]}"
+                        PROJ_NAME="${PROJECTS_WITH_ISSUES_NAMES[$IDX]}"
+                        ISSUES="${PROJECTS_WITH_ISSUES_DETAILS[$IDX]}"
+                        BUCKET="${PROJECTS_WITH_ISSUES_BUCKETS[$IDX]}"
+                        
+                        print_info "\nFixing resources for: $PROJ_ID"
+                        
+                        # Fix billing
+                        if echo "$ISSUES" | grep -q "billing"; then
+                            print_info "Linking billing account..."
+                            BILLING_LINKED=false
+                            BILLING_RETRIES=0
+                            MAX_BILLING_RETRIES=3
+                            
+                            while [ "$BILLING_LINKED" = false ] && [ $BILLING_RETRIES -lt $MAX_BILLING_RETRIES ]; do
+                                BILLING_RESULT=$(gcloud billing projects link "$PROJ_ID" --billing-account="$BILLING_ACCOUNT" 2>&1)
+                                
+                                if [ $? -eq 0 ]; then
+                                    print_success "Billing linked"
+                                    BILLING_LINKED=true
+                                elif echo "$BILLING_RESULT" | grep -qiE "quota|QUOTA|Quota exceeded"; then
+                                    BILLING_RETRIES=$((BILLING_RETRIES + 1))
+                                    if [ $BILLING_RETRIES -lt $MAX_BILLING_RETRIES ]; then
+                                        print_warning "Billing quota exceeded. Waiting 60 seconds (attempt $BILLING_RETRIES/$MAX_BILLING_RETRIES)..."
+                                        sleep 60
+                                    else
+                                        print_error "Failed to link billing after $MAX_BILLING_RETRIES attempts"
+                                        break
+                                    fi
+                                else
+                                    print_error "Failed to link billing: $BILLING_RESULT"
+                                    break
+                                fi
+                            done
+                        fi
+                        
+                        # Fix missing service account
+                        if echo "$ISSUES" | grep -qE "service-account"; then
+                            SA_NAME="infra-manager-sa"
+                            SA_EMAIL="$SA_NAME@$PROJ_ID.iam.gserviceaccount.com"
+                            
+                            if echo "$ISSUES" | grep -q "service-account "; then
+                                print_info "Creating Infrastructure Manager service account..."
+                                if gcloud iam service-accounts create "$SA_NAME" \
+                                    --display-name="Infrastructure Manager Service Account" \
+                                    --description="Service account for managing infrastructure with Terraform/Infrastructure Manager" \
+                                    --project="$PROJ_ID" 2>/dev/null; then
+                                    print_success "Service account created: $SA_EMAIL"
+                                else
+                                    print_warning "Failed to create service account"
+                                fi
+                            fi
+                            
+                            if echo "$ISSUES" | grep -q "service-account-roles"; then
+                                print_info "Granting IAM roles to service account..."
+                            fi
+                            
+                            # Grant/update IAM roles
+                            ROLES=(
+                                "roles/editor"
+                                "roles/storage.admin"
+                                "roles/iam.serviceAccountUser"
+                            )
+                            
+                            for ROLE in "${ROLES[@]}"; do
+                                gcloud projects add-iam-policy-binding "$PROJ_ID" \
+                                    --member="serviceAccount:$SA_EMAIL" \
+                                    --role="$ROLE" \
+                                    --condition=None &>/dev/null
+                            done
+                            print_success "IAM roles configured"
+                        fi
+                        
+                        # Fix missing bucket
+                        if echo "$ISSUES" | grep -q "bucket"; then
+                            BUCKET_NAME="$PROJ_ID-$REGION-state-$RANDOM"
+                            print_info "Creating state bucket: $BUCKET_NAME"
+                            
+                            if gcloud storage buckets create "gs://$BUCKET_NAME" \
+                                --project="$PROJ_ID" \
+                                --location="$REGION" \
+                                --uniform-bucket-level-access \
+                                --public-access-prevention &>/dev/null; then
+                                print_success "Bucket created: $BUCKET_NAME"
+                                BUCKET="$BUCKET_NAME"
+                                
+                                # Wait for propagation
+                                print_info "Waiting for bucket to be ready..."
+                                sleep 10
+                                
+                                # Auto-enable versioning and lifecycle for new bucket
+                                ISSUES="$ISSUES versioning lifecycle "
+                            else
+                                print_error "Failed to create bucket"
+                            fi
+                        fi
+                        
+                        # Fix versioning
+                        if echo "$ISSUES" | grep -q "versioning" && [ -n "$BUCKET" ]; then
+                            print_info "Enabling versioning on $BUCKET..."
+                            VERSIONING_SUCCESS=false
+                            VERSIONING_RETRIES=0
+                            MAX_VERSIONING_RETRIES=3
+                            
+                            while [ "$VERSIONING_SUCCESS" = false ] && [ $VERSIONING_RETRIES -lt $MAX_VERSIONING_RETRIES ]; do
+                                VERSIONING_RESULT=$(gcloud storage buckets update "gs://$BUCKET" --versioning 2>&1)
+                                
+                                if [ $? -eq 0 ]; then
+                                    print_success "Versioning enabled"
+                                    VERSIONING_SUCCESS=true
+                                else
+                                    VERSIONING_RETRIES=$((VERSIONING_RETRIES + 1))
+                                    if [ $VERSIONING_RETRIES -lt $MAX_VERSIONING_RETRIES ]; then
+                                        print_warning "Retry in 5 seconds (attempt $VERSIONING_RETRIES/$MAX_VERSIONING_RETRIES)..."
+                                        sleep 5
+                                    else
+                                        print_warning "Failed to enable versioning after $MAX_VERSIONING_RETRIES attempts"
+                                    fi
+                                fi
+                            done
+                        fi
+                        
+                        # Fix lifecycle
+                        if echo "$ISSUES" | grep -q "lifecycle" && [ -n "$BUCKET" ]; then
+                            print_info "Adding lifecycle rule..."
+                            LIFECYCLE_CONFIG=$(cat <<EOF
+{
+  "lifecycle": {
+    "rule": [
+      {
+        "action": {"type": "Delete"},
+        "condition": {"daysSinceNoncurrentTime": 30}
+      }
+    ]
+  }
+}
+EOF
+)
+                            
+                            TEMP_LIFECYCLE_FILE=$(mktemp)
+                            echo "$LIFECYCLE_CONFIG" > "$TEMP_LIFECYCLE_FILE"
+                            
+                            LIFECYCLE_SUCCESS=false
+                            LIFECYCLE_RETRIES=0
+                            MAX_LIFECYCLE_RETRIES=3
+                            
+                            while [ "$LIFECYCLE_SUCCESS" = false ] && [ $LIFECYCLE_RETRIES -lt $MAX_LIFECYCLE_RETRIES ]; do
+                                LIFECYCLE_RESULT=$(gcloud storage buckets update "gs://$BUCKET" --lifecycle-file="$TEMP_LIFECYCLE_FILE" 2>&1)
+                                
+                                if [ $? -eq 0 ]; then
+                                    print_success "Lifecycle rule applied"
+                                    LIFECYCLE_SUCCESS=true
+                                else
+                                    LIFECYCLE_RETRIES=$((LIFECYCLE_RETRIES + 1))
+                                    if [ $LIFECYCLE_RETRIES -lt $MAX_LIFECYCLE_RETRIES ]; then
+                                        print_warning "Retry in 5 seconds (attempt $LIFECYCLE_RETRIES/$MAX_LIFECYCLE_RETRIES)..."
+                                        sleep 5
+                                    else
+                                        print_warning "Failed to apply lifecycle rule after $MAX_LIFECYCLE_RETRIES attempts"
+                                    fi
+                                fi
+                            done
+                            
+                            rm -f "$TEMP_LIFECYCLE_FILE"
+                        fi
+                        
+                        print_success "Completed fixes for $PROJ_ID\n"
+                    done
+                fi
+            fi
         else
             print_info "No existing projects found in this folder."
         fi
@@ -722,16 +1010,23 @@ for FOLDER in "${FOLDERS[@]}"; do
     
     print_info "Creating folder: $FOLDER"
     
-    FOLDER_RESULT=$(gcloud resource-manager folders create \
+    FOLDER_RESULT=$(retry_with_backoff "folder creation" \
+        gcloud resource-manager folders create \
         --display-name="$FOLDER" \
         --organization="$ORGANIZATION_ID" \
-        --format="value(name)" 2>&1)
+        --format="value(name)")
     
     if [ $? -eq 0 ]; then
         # Extract folder ID from 'folders/123456789' format (take last line)
         FOLDER_ID=$(echo "$FOLDER_RESULT" | tail -n 1 | sed 's|folders/||')
         FOLDER_IDS["$FOLDER"]="$FOLDER_ID"
         print_success "Created folder '$FOLDER' (ID: $FOLDER_ID)"
+        
+        # Add delay between folder creations to avoid rate limits
+        if [ "$FOLDER" != "${FOLDERS[-1]}" ]; then
+            print_info "Waiting 2 seconds to avoid rate limits..."
+            sleep 2
+        fi
     else
         # Check if folder already exists
         if echo "$FOLDER_RESULT" | grep -q "FOLDER_NAME_UNIQUENESS_VIOLATION"; then
@@ -780,25 +1075,58 @@ for FOLDER in "${FOLDERS[@]}"; do
         echo ""
         echo -e "${CYAN}─── Creating Project: $PROJECT_ID ───${NC}"
         
-        # Create project
+        # Create project with retry logic
         print_info "Creating project..."
-        if gcloud projects create "$PROJECT_ID" \
+        PROJECT_RESULT=$(retry_with_backoff "project creation" \
+            gcloud projects create "$PROJECT_ID" \
             --folder="$FOLDER_ID" \
             --name="$PROJECT_NAME" \
-            --format="value(projectId)" &>/dev/null; then
+            --format="value(projectId)")
+        
+        if [ $? -eq 0 ]; then
             print_success "Project created: $PROJECT_ID"
         else
             print_error "Failed to create project '$PROJECT_ID'"
             print_warning "Project ID might already exist. Trying to continue..."
         fi
         
-        # Link billing
+        # Add delay to avoid rate limits (stagger API calls)
+        print_info "Waiting 3 seconds to avoid rate limits..."
+        sleep 3
+        
+        # Link billing (critical for bucket creation)
+        # Note: Billing API has strict quota (~5-10 links per minute)
         print_info "Linking billing account..."
-        if gcloud billing projects link "$PROJECT_ID" \
-            --billing-account="$BILLING_ACCOUNT" &>/dev/null; then
-            print_success "Billing linked"
-        else
-            print_warning "Failed to link billing. You may need to do this manually."
+        BILLING_LINKED=false
+        BILLING_RETRIES=0
+        MAX_BILLING_RETRIES=3
+        
+        while [ "$BILLING_LINKED" = false ] && [ $BILLING_RETRIES -lt $MAX_BILLING_RETRIES ]; do
+            BILLING_RESULT=$(gcloud billing projects link "$PROJECT_ID" \
+                --billing-account="$BILLING_ACCOUNT" 2>&1)
+            
+            if [ $? -eq 0 ]; then
+                print_success "Billing linked"
+                BILLING_LINKED=true
+            elif echo "$BILLING_RESULT" | grep -qiE "quota|QUOTA|Quota exceeded"; then
+                BILLING_RETRIES=$((BILLING_RETRIES + 1))
+                if [ $BILLING_RETRIES -lt $MAX_BILLING_RETRIES ]; then
+                    print_warning "Billing quota exceeded. Waiting 60 seconds for quota reset (attempt $BILLING_RETRIES/$MAX_BILLING_RETRIES)..."
+                    sleep 60
+                else
+                    print_error "Failed to link billing after $MAX_BILLING_RETRIES attempts: $BILLING_RESULT"
+                    print_warning "Billing quota limit reached. Wait 5-10 minutes and run the script again."
+                    print_warning "Skipping bucket creation for this project."
+                fi
+            else
+                print_error "Failed to link billing: $BILLING_RESULT"
+                print_warning "Skipping bucket creation for this project (requires billing)."
+                break
+            fi
+        done
+        
+        if [ "$BILLING_LINKED" = false ]; then
+            continue
         fi
         
         # Enable APIs
@@ -815,6 +1143,37 @@ for FOLDER in "${FOLDERS[@]}"; do
         done
         print_success "APIs enabled"
         
+        # Create Infrastructure Manager service account
+        SA_NAME="infra-manager-sa"
+        SA_EMAIL="$SA_NAME@$PROJECT_ID.iam.gserviceaccount.com"
+        print_info "Creating Infrastructure Manager service account..."
+        
+        if gcloud iam service-accounts create "$SA_NAME" \
+            --display-name="Infrastructure Manager Service Account" \
+            --description="Service account for managing infrastructure with Terraform/Infrastructure Manager" \
+            --project="$PROJECT_ID" 2>/dev/null; then
+            print_success "Service account created: $SA_EMAIL"
+            
+            # Grant required IAM roles
+            print_info "Granting IAM roles to service account..."
+            ROLES=(
+                "roles/editor"
+                "roles/storage.admin"
+                "roles/iam.serviceAccountUser"
+            )
+            
+            for ROLE in "${ROLES[@]}"; do
+                gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+                    --member="serviceAccount:$SA_EMAIL" \
+                    --role="$ROLE" \
+                    --condition=None &>/dev/null
+            done
+            print_success "IAM roles granted (Editor, Storage Admin, Service Account User)"
+        else
+            print_warning "Failed to create service account"
+            print_info "You can create it manually later with: gcloud iam service-accounts create $SA_NAME --project=$PROJECT_ID"
+        fi
+        
         # Create GCS bucket
         BUCKET_NAME="$PROJECT_ID-$REGION-state-$RANDOM"
         print_info "Creating state bucket: $BUCKET_NAME"
@@ -826,14 +1185,33 @@ for FOLDER in "${FOLDERS[@]}"; do
             --public-access-prevention &>/dev/null; then
             print_success "Bucket created: $BUCKET_NAME"
             
-            # Enable versioning
+            # Wait for bucket to propagate (increased delay for reliability)
+            print_info "Waiting for bucket to be ready..."
+            sleep 10
+            
+            # Enable versioning with retry logic
             print_info "Enabling versioning on bucket..."
-            if gcloud storage buckets update "gs://$BUCKET_NAME" --versioning &>/dev/null; then
-                print_success "Versioning enabled"
-            else
-                print_warning "Failed to enable versioning. You can enable it manually:"
-                print_warning "gcloud storage buckets update gs://$BUCKET_NAME --versioning"
-            fi
+            VERSIONING_SUCCESS=false
+            VERSIONING_RETRIES=0
+            MAX_VERSIONING_RETRIES=3
+            
+            while [ "$VERSIONING_SUCCESS" = false ] && [ $VERSIONING_RETRIES -lt $MAX_VERSIONING_RETRIES ]; do
+                VERSIONING_RESULT=$(gcloud storage buckets update "gs://$BUCKET_NAME" --versioning 2>&1)
+                
+                if [ $? -eq 0 ]; then
+                    print_success "Versioning enabled"
+                    VERSIONING_SUCCESS=true
+                else
+                    VERSIONING_RETRIES=$((VERSIONING_RETRIES + 1))
+                    if [ $VERSIONING_RETRIES -lt $MAX_VERSIONING_RETRIES ]; then
+                        print_warning "Versioning failed (attempt $VERSIONING_RETRIES/$MAX_VERSIONING_RETRIES). Retrying in 5 seconds..."
+                        sleep 5
+                    else
+                        print_warning "Failed to enable versioning after $MAX_VERSIONING_RETRIES attempts: $VERSIONING_RESULT"
+                        print_warning "You can enable it manually: gcloud storage buckets update gs://$BUCKET_NAME --versioning"
+                    fi
+                fi
+            done
             
             # Add lifecycle rule to manage old versions (cost optimization)
             print_info "Adding lifecycle rule to delete old versions after 30 days..."
@@ -859,12 +1237,27 @@ EOF
             TEMP_LIFECYCLE_FILE=$(mktemp)
             echo "$LIFECYCLE_CONFIG" > "$TEMP_LIFECYCLE_FILE"
             
-            if gcloud storage buckets update "gs://$BUCKET_NAME" --lifecycle-file="$TEMP_LIFECYCLE_FILE" &>/dev/null; then
-                print_success "Lifecycle rule applied (old versions deleted after 30 days)"
-            else
-                print_warning "Failed to apply lifecycle rule"
-                print_info "Bucket will keep all versions indefinitely (may increase costs)"
-            fi
+            LIFECYCLE_SUCCESS=false
+            LIFECYCLE_RETRIES=0
+            MAX_LIFECYCLE_RETRIES=3
+            
+            while [ "$LIFECYCLE_SUCCESS" = false ] && [ $LIFECYCLE_RETRIES -lt $MAX_LIFECYCLE_RETRIES ]; do
+                LIFECYCLE_RESULT=$(gcloud storage buckets update "gs://$BUCKET_NAME" --lifecycle-file="$TEMP_LIFECYCLE_FILE" 2>&1)
+                
+                if [ $? -eq 0 ]; then
+                    print_success "Lifecycle rule applied (old versions deleted after 30 days)"
+                    LIFECYCLE_SUCCESS=true
+                else
+                    LIFECYCLE_RETRIES=$((LIFECYCLE_RETRIES + 1))
+                    if [ $LIFECYCLE_RETRIES -lt $MAX_LIFECYCLE_RETRIES ]; then
+                        print_warning "Lifecycle rule failed (attempt $LIFECYCLE_RETRIES/$MAX_LIFECYCLE_RETRIES). Retrying in 5 seconds..."
+                        sleep 5
+                    else
+                        print_warning "Failed to apply lifecycle rule after $MAX_LIFECYCLE_RETRIES attempts: $LIFECYCLE_RESULT"
+                        print_info "Bucket will keep all versions indefinitely (may increase costs)"
+                    fi
+                fi
+            done
             
             rm -f "$TEMP_LIFECYCLE_FILE"
             

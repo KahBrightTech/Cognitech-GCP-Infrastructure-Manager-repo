@@ -363,8 +363,40 @@ if ($action -eq "2") {
 }
 
 # ============================================================================
-# HELPER FUNCTIONS: Resource Discovery
+# HELPER FUNCTIONS: Resource Discovery and Retry Logic
 # ============================================================================
+function Invoke-WithRetry {
+    param(
+        [ScriptBlock]$ScriptBlock,
+        [int]$MaxRetries = 3,
+        [int]$BaseDelay = 5,
+        [string]$Operation = "operation"
+    )
+    
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        $result = & $ScriptBlock
+        
+        if ($LASTEXITCODE -eq 0) {
+            return $result
+        }
+        
+        # Check if it's a rate limit error
+        if ($result -match "429|RATE_LIMIT_EXCEEDED|Quota exceeded") {
+            if ($attempt -lt $MaxRetries) {
+                $delay = $BaseDelay * [Math]::Pow(2, $attempt - 1)
+                Write-Warning "Rate limit hit. Waiting $delay seconds before retry $attempt of $MaxRetries..."
+                Start-Sleep -Seconds $delay
+            } else {
+                Write-Error "Max retries reached for $Operation"
+                return $result
+            }
+        } else {
+            # Non-rate-limit error, don't retry
+            return $result
+        }
+    }
+}
+
 function Get-ExistingFolders {
     param([string]$OrgId)
     
@@ -414,6 +446,70 @@ function Get-FolderProjects {
         return $projects
     }
     return @()
+}
+
+function Check-ProjectResources {
+    param(
+        [string]$ProjectId,
+        [string]$BillingAccount,
+        [string]$Region
+    )
+    
+    $issues = @()
+    
+    # Check billing
+    $billingInfo = gcloud billing projects describe $ProjectId --format="value(billingAccountName)" 2>$null
+    if (-not $billingInfo) {
+        $issues += "billing"
+    }
+    
+    # Check for Infrastructure Manager service account
+    $saEmail = "infra-manager-sa@$ProjectId.iam.gserviceaccount.com"
+    $saExists = gcloud iam service-accounts describe $saEmail --project=$ProjectId --format="value(email)" 2>$null
+    if (-not $saExists) {
+        $issues += "service-account"
+    } else {
+        # Check if service account has required roles
+        $saRoles = gcloud projects get-iam-policy $ProjectId --flatten="bindings[].members" --filter="bindings.members:serviceAccount:$saEmail" --format="value(bindings.role)" 2>$null
+        $requiredRoles = @("roles/editor", "roles/storage.admin", "roles/iam.serviceAccountUser")
+        foreach ($role in $requiredRoles) {
+            if ($saRoles -notcontains $role) {
+                $issues += "service-account-roles"
+                break
+            }
+        }
+    }
+    
+    # Check for state bucket
+    $buckets = gcloud storage buckets list --project=$ProjectId --format="value(name)" 2>$null | Where-Object { $_ -match "$ProjectId.*state" }
+    
+    if (-not $buckets) {
+        $issues += "bucket"
+    } else {
+        $bucketName = $buckets | Select-Object -First 1
+        
+        # Check versioning
+        $versioning = gcloud storage buckets describe "gs://$bucketName" --format="value(versioning.enabled)" 2>$null
+        if ($versioning -ne "True") {
+            $issues += "versioning"
+        }
+        
+        # Check lifecycle
+        $lifecycleRaw = gcloud storage buckets describe "gs://$bucketName" --format="json" 2>$null
+        if ($lifecycleRaw) {
+            $lifecycleObj = $lifecycleRaw | ConvertFrom-Json
+            if (-not $lifecycleObj.lifecycle -or -not $lifecycleObj.lifecycle.rule) {
+                $issues += "lifecycle"
+            }
+        }
+    }
+    
+    return [PSCustomObject]@{
+        ProjectId = $ProjectId
+        Issues = $issues
+        BucketName = if ($buckets) { $buckets | Select-Object -First 1 } else { $null }
+        ServiceAccount = $saEmail
+    }
 }
 
 # ============================================================================
@@ -554,12 +650,202 @@ foreach ($folder in $folders) {
             Write-Host ""
             Write-Host "  Existing projects in '$folder':" -ForegroundColor Yellow
             Write-Host "  ─────────────────────────────────────────────────" -ForegroundColor Gray
+            
+            # Validate each existing project for missing resources
+            $projectsWithIssues = @()
+            
             for ($i = 0; $i -lt $existingProjects.Count; $i++) {
                 $proj = $existingProjects[$i]
                 Write-Host "    [$($i + 1)] $($proj.Name)" -ForegroundColor White
                 Write-Host "        ID: $($proj.ProjectId)" -ForegroundColor Gray
+                
+                # Check project resources
+                $validation = Check-ProjectResources -ProjectId $proj.ProjectId -BillingAccount $BillingAccount -Region $Region
+                
+                if ($validation.Issues.Count -gt 0) {
+                    $projectsWithIssues += $validation
+                    Write-Host "        ⚠️  Missing: $($validation.Issues -join ', ')" -ForegroundColor Yellow
+                } else {
+                    Write-Host "        ✓ Complete" -ForegroundColor Green
+                }
             }
             Write-Host "  ─────────────────────────────────────────────────`n" -ForegroundColor Gray
+            
+            # Offer to fix missing resources
+            if ($projectsWithIssues.Count -gt 0) {
+                Write-Warning "Found $($projectsWithIssues.Count) project(s) with missing resources."
+                $fixMissing = Read-Host "Would you like to fix missing resources for existing projects? (y/n)"
+                
+                if ($fixMissing -eq 'y') {
+                    foreach ($projValidation in $projectsWithIssues) {
+                        Write-Info "`nFixing resources for: $($projValidation.ProjectId)"
+                        
+                        # Fix billing
+                        if ($projValidation.Issues -contains "billing") {
+                            Write-Info "Linking billing account..."
+                            $billingLinked = $false
+                            $billingRetries = 0
+                            $maxBillingRetries = 3
+                            
+                            while (-not $billingLinked -and $billingRetries -lt $maxBillingRetries) {
+                                $billingResult = gcloud billing projects link $($projValidation.ProjectId) `
+                                    --billing-account=$BillingAccount 2>&1
+                                
+                                if ($LASTEXITCODE -eq 0) {
+                                    Write-Success "Billing linked"
+                                    $billingLinked = $true
+                                } elseif ($billingResult -match "quota|QUOTA|Quota exceeded") {
+                                    $billingRetries++
+                                    if ($billingRetries -lt $maxBillingRetries) {
+                                        Write-Warning "Billing quota exceeded. Waiting 60 seconds (attempt $billingRetries/$maxBillingRetries)..."
+                                        Start-Sleep -Seconds 60
+                                    } else {
+                                        Write-Error "Failed to link billing after $maxBillingRetries attempts"
+                                        break
+                                    }
+                                } else {
+                                    Write-Error "Failed to link billing: $billingResult"
+                                    break
+                                }
+                            }
+                        }
+                        
+                        # Fix missing service account
+                        if ($projValidation.Issues -contains "service-account" -or $projValidation.Issues -contains "service-account-roles") {
+                            $saName = "infra-manager-sa"
+                            $saEmail = "$saName@$($projValidation.ProjectId).iam.gserviceaccount.com"
+                            
+                            if ($projValidation.Issues -contains "service-account") {
+                                Write-Info "Creating Infrastructure Manager service account..."
+                                $saResult = gcloud iam service-accounts create $saName `
+                                    --display-name="Infrastructure Manager Service Account" `
+                                    --description="Service account for managing infrastructure with Terraform/Infrastructure Manager" `
+                                    --project=$($projValidation.ProjectId) 2>&1
+                                
+                                if ($LASTEXITCODE -eq 0) {
+                                    Write-Success "Service account created: $saEmail"
+                                } else {
+                                    Write-Warning "Failed to create service account: $saResult"
+                                }
+                            }
+                            
+                            if ($projValidation.Issues -contains "service-account-roles") {
+                                Write-Info "Granting IAM roles to service account..."
+                            }
+                            
+                            # Grant/update IAM roles
+                            $roles = @(
+                                "roles/editor",
+                                "roles/storage.admin",
+                                "roles/iam.serviceAccountUser"
+                            )
+                            
+                            foreach ($role in $roles) {
+                                $roleResult = gcloud projects add-iam-policy-binding $($projValidation.ProjectId) `
+                                    --member="serviceAccount:$saEmail" `
+                                    --role=$role `
+                                    --condition=None 2>&1 | Out-Null
+                            }
+                            Write-Success "IAM roles configured"
+                        }
+                        
+                        # Fix missing bucket
+                        if ($projValidation.Issues -contains "bucket") {
+                            $bucketName = "$($projValidation.ProjectId)-$Region-state-$(Get-Random -Minimum 1000 -Maximum 9999)"
+                            Write-Info "Creating state bucket: $bucketName"
+                            
+                            $bucketResult = gcloud storage buckets create "gs://$bucketName" `
+                                --project=$($projValidation.ProjectId) `
+                                --location=$Region `
+                                --uniform-bucket-level-access `
+                                --public-access-prevention 2>&1
+                            
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Success "Bucket created: $bucketName"
+                                $projValidation.BucketName = $bucketName
+                                
+                                # Wait for propagation
+                                Write-Info "Waiting for bucket to be ready..."
+                                Start-Sleep -Seconds 10
+                                
+                                # Auto-enable versioning and lifecycle for new bucket
+                                $projValidation.Issues += @("versioning", "lifecycle")
+                            } else {
+                                Write-Error "Failed to create bucket: $bucketResult"
+                            }
+                        }
+                        
+                        # Fix versioning
+                        if ($projValidation.Issues -contains "versioning" -and $projValidation.BucketName) {
+                            Write-Info "Enabling versioning on $($projValidation.BucketName)..."
+                            $versioningSuccess = $false
+                            $versioningRetries = 0
+                            $maxVersioningRetries = 3
+                            
+                            while (-not $versioningSuccess -and $versioningRetries -lt $maxVersioningRetries) {
+                                $versioningResult = gcloud storage buckets update "gs://$($projValidation.BucketName)" --versioning 2>&1
+                                
+                                if ($LASTEXITCODE -eq 0) {
+                                    Write-Success "Versioning enabled"
+                                    $versioningSuccess = $true
+                                } else {
+                                    $versioningRetries++
+                                    if ($versioningRetries -lt $maxVersioningRetries) {
+                                        Write-Warning "Retry in 5 seconds (attempt $versioningRetries/$maxVersioningRetries)..."
+                                        Start-Sleep -Seconds 5
+                                    } else {
+                                        Write-Warning "Failed to enable versioning after $maxVersioningRetries attempts"
+                                    }
+                                }
+                            }
+                        }
+                        
+                        # Fix lifecycle
+                        if ($projValidation.Issues -contains "lifecycle" -and $projValidation.BucketName) {
+                            Write-Info "Adding lifecycle rule..."
+                            $lifecycleConfig = @"
+{
+  "lifecycle": {
+    "rule": [
+      {
+        "action": {"type": "Delete"},
+        "condition": {"daysSinceNoncurrentTime": 30}
+      }
+    ]
+  }
+}
+"@
+                            $tempFile = [System.IO.Path]::GetTempFileName()
+                            $lifecycleConfig | Set-Content -Path $tempFile
+                            
+                            $lifecycleSuccess = $false
+                            $lifecycleRetries = 0
+                            $maxLifecycleRetries = 3
+                            
+                            while (-not $lifecycleSuccess -and $lifecycleRetries -lt $maxLifecycleRetries) {
+                                $lifecycleResult = gcloud storage buckets update "gs://$($projValidation.BucketName)" --lifecycle-file=$tempFile 2>&1
+                                
+                                if ($LASTEXITCODE -eq 0) {
+                                    Write-Success "Lifecycle rule applied"
+                                    $lifecycleSuccess = $true
+                                } else {
+                                    $lifecycleRetries++
+                                    if ($lifecycleRetries -lt $maxLifecycleRetries) {
+                                        Write-Warning "Retry in 5 seconds (attempt $lifecycleRetries/$maxLifecycleRetries)..."
+                                        Start-Sleep -Seconds 5
+                                    } else {
+                                        Write-Warning "Failed to apply lifecycle rule after $maxLifecycleRetries attempts"
+                                    }
+                                }
+                            }
+                            
+                            Remove-Item $tempFile -ErrorAction SilentlyContinue
+                        }
+                        
+                        Write-Success "Completed fixes for $($projValidation.ProjectId)`n"
+                    }
+                }
+            }
         } else {
             Write-Info "No existing projects found in this folder."
         }
@@ -692,16 +978,24 @@ foreach ($folder in $folders) {
     
     Write-Info "Creating folder: $folder"
     
-    $result = gcloud resource-manager folders create `
-        --display-name="$folder" `
-        --organization=$OrganizationId `
-        --format="value(name)" 2>&1
+    $result = Invoke-WithRetry -Operation "folder creation" -ScriptBlock {
+        gcloud resource-manager folders create `
+            --display-name="$folder" `
+            --organization=$OrganizationId `
+            --format="value(name)" 2>&1
+    }
     
     if ($LASTEXITCODE -eq 0) {
         # Extract folder ID from 'folders/123456789' format
         $folderId = ($result | Select-Object -Last 1) -replace 'folders/', ''
         $folderIds[$folder] = $folderId
         Write-Success "Created folder '$folder' (ID: $folderId)"
+        
+        # Add delay between folder creations to avoid rate limits
+        if ($Folders.IndexOf($folder) -lt $Folders.Count - 1) {
+            Write-Info "Waiting 2 seconds to avoid rate limits..."
+            Start-Sleep -Seconds 2
+        }
     } else {
         # Check if folder already exists
         if ($result -match "FOLDER_NAME_UNIQUENESS_VIOLATION") {
@@ -750,12 +1044,14 @@ foreach ($folder in $folders) {
         
         Write-Host "`n─── Creating Project: $projectId ───" -ForegroundColor Cyan
         
-        # Create project
+        # Create project with retry logic
         Write-Info "Creating project..."
-        $createResult = gcloud projects create $projectId `
-            --folder=$folderId `
-            --name="$projectName" `
-            --format="value(projectId)" 2>&1
+        $createResult = Invoke-WithRetry -Operation "project creation" -ScriptBlock {
+            gcloud projects create $projectId `
+                --folder=$folderId `
+                --name="$projectName" `
+                --format="value(projectId)" 2>&1
+        }
         
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Failed to create project '$projectId': $createResult"
@@ -764,15 +1060,43 @@ foreach ($folder in $folders) {
             Write-Success "Project created: $projectId"
         }
         
-        # Link billing
-        Write-Info "Linking billing account..."
-        gcloud billing projects link $projectId `
-            --billing-account=$BillingAccount 2>&1 | Out-Null
+        # Add delay to avoid rate limits (stagger API calls)
+        Write-Info "Waiting 3 seconds to avoid rate limits..."
+        Start-Sleep -Seconds 3
         
-        if ($LASTEXITCODE -eq 0) {
-            Write-Success "Billing linked"
-        } else {
-            Write-Warning "Failed to link billing. You may need to do this manually."
+        # Link billing (critical for bucket creation)
+        # Note: Billing API has strict quota (~5-10 links per minute)
+        Write-Info "Linking billing account..."
+        $billingLinked = $false
+        $billingRetries = 0
+        $maxBillingRetries = 3
+        
+        while (-not $billingLinked -and $billingRetries -lt $maxBillingRetries) {
+            $billingResult = gcloud billing projects link $projectId `
+                --billing-account=$BillingAccount 2>&1
+            
+            if ($LASTEXITCODE -eq 0) {
+                Write-Success "Billing linked"
+                $billingLinked = $true
+            } elseif ($billingResult -match "quota|QUOTA|Quota exceeded") {
+                $billingRetries++
+                if ($billingRetries -lt $maxBillingRetries) {
+                    Write-Warning "Billing quota exceeded. Waiting 60 seconds for quota reset (attempt $billingRetries/$maxBillingRetries)..."
+                    Start-Sleep -Seconds 60
+                } else {
+                    Write-Error "Failed to link billing after $maxBillingRetries attempts: $billingResult"
+                    Write-Warning "Billing quota limit reached. Wait 5-10 minutes and run the script again."
+                    Write-Warning "Skipping bucket creation for this project."
+                }
+            } else {
+                Write-Error "Failed to link billing: $billingResult"
+                Write-Warning "Skipping bucket creation for this project (requires billing)."
+                break
+            }
+        }
+        
+        if (-not $billingLinked) {
+            continue
         }
         
         # Enable APIs
@@ -789,6 +1113,39 @@ foreach ($folder in $folders) {
         }
         Write-Success "APIs enabled"
         
+        # Create Infrastructure Manager service account
+        $saName = "infra-manager-sa"
+        $saEmail = "$saName@$projectId.iam.gserviceaccount.com"
+        Write-Info "Creating Infrastructure Manager service account..."
+        
+        $saResult = gcloud iam service-accounts create $saName `
+            --display-name="Infrastructure Manager Service Account" `
+            --description="Service account for managing infrastructure with Terraform/Infrastructure Manager" `
+            --project=$projectId 2>&1
+        
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "Service account created: $saEmail"
+            
+            # Grant required IAM roles
+            Write-Info "Granting IAM roles to service account..."
+            $roles = @(
+                "roles/editor",
+                "roles/storage.admin",
+                "roles/iam.serviceAccountUser"
+            )
+            
+            foreach ($role in $roles) {
+                $roleResult = gcloud projects add-iam-policy-binding $projectId `
+                    --member="serviceAccount:$saEmail" `
+                    --role=$role `
+                    --condition=None 2>&1 | Out-Null
+            }
+            Write-Success "IAM roles granted (Editor, Storage Admin, Service Account User)"
+        } else {
+            Write-Warning "Failed to create service account: $saResult"
+            Write-Info "You can create it manually later with: gcloud iam service-accounts create $saName --project=$projectId"
+        }
+        
         # Create GCS bucket
         $bucketName = "$projectId-$Region-state-$(Get-Random -Minimum 1000 -Maximum 9999)"
         Write-Info "Creating state bucket: $bucketName"
@@ -802,15 +1159,32 @@ foreach ($folder in $folders) {
         if ($LASTEXITCODE -eq 0) {
             Write-Success "Bucket created: $bucketName"
             
-            # Enable versioning
-            Write-Info "Enabling versioning on bucket..."
-            $versioningResult = gcloud storage buckets update "gs://$bucketName" --versioning 2>&1
+            # Wait for bucket to propagate (increased delay for reliability)
+            Write-Info "Waiting for bucket to be ready..."
+            Start-Sleep -Seconds 10
             
-            if ($LASTEXITCODE -eq 0) {
-                Write-Success "Versioning enabled"
-            } else {
-                Write-Warning "Failed to enable versioning: $versioningResult"
-                Write-Warning "You can enable it manually: gcloud storage buckets update gs://$bucketName --versioning"
+            # Enable versioning with retry logic
+            Write-Info "Enabling versioning on bucket..."
+            $versioningSuccess = $false
+            $versioningRetries = 0
+            $maxVersioningRetries = 3
+            
+            while (-not $versioningSuccess -and $versioningRetries -lt $maxVersioningRetries) {
+                $versioningResult = gcloud storage buckets update "gs://$bucketName" --versioning 2>&1
+                
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Success "Versioning enabled"
+                    $versioningSuccess = $true
+                } else {
+                    $versioningRetries++
+                    if ($versioningRetries -lt $maxVersioningRetries) {
+                        Write-Warning "Versioning failed (attempt $versioningRetries/$maxVersioningRetries). Retrying in 5 seconds..."
+                        Start-Sleep -Seconds 5
+                    } else {
+                        Write-Warning "Failed to enable versioning after $maxVersioningRetries attempts: $versioningResult"
+                        Write-Warning "You can enable it manually: gcloud storage buckets update gs://$bucketName --versioning"
+                    }
+                }
             }
             
             # Add lifecycle rule to manage old versions (cost optimization)
@@ -836,21 +1210,36 @@ foreach ($folder in $folders) {
             $tempFile = [System.IO.Path]::GetTempFileName()
             $lifecycleConfig | Out-File -FilePath $tempFile -Encoding UTF8
             
-            $lifecycleResult = gcloud storage buckets update "gs://$bucketName" --lifecycle-file=$tempFile 2>&1
-            Remove-Item $tempFile -ErrorAction SilentlyContinue
+            $lifecycleSuccess = $false
+            $lifecycleRetries = 0
+            $maxLifecycleRetries = 3
             
-            if ($LASTEXITCODE -eq 0) {
-                Write-Success "Lifecycle rule applied (old versions deleted after 30 days)"
-            } else {
-                Write-Warning "Failed to apply lifecycle rule: $lifecycleResult"
-                Write-Info "Bucket will keep all versions indefinitely (may increase costs)"
+            while (-not $lifecycleSuccess -and $lifecycleRetries -lt $maxLifecycleRetries) {
+                $lifecycleResult = gcloud storage buckets update "gs://$bucketName" --lifecycle-file=$tempFile 2>&1
+                
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Success "Lifecycle rule applied (old versions deleted after 30 days)"
+                    $lifecycleSuccess = $true
+                } else {
+                    $lifecycleRetries++
+                    if ($lifecycleRetries -lt $maxLifecycleRetries) {
+                        Write-Warning "Lifecycle rule failed (attempt $lifecycleRetries/$maxLifecycleRetries). Retrying in 5 seconds..."
+                        Start-Sleep -Seconds 5
+                    } else {
+                        Write-Warning "Failed to apply lifecycle rule after $maxLifecycleRetries attempts: $lifecycleResult"
+                        Write-Info "Bucket will keep all versions indefinitely (may increase costs)"
+                    }
+                }
             }
+            
+            Remove-Item $tempFile -ErrorAction SilentlyContinue
             
             $createdResources += [PSCustomObject]@{
                 Folder = $folder
                 FolderId = $folderId
                 ProjectId = $projectId
                 ProjectName = $projectName
+                ServiceAccount = $saEmail
                 Bucket = $bucketName
                 Region = $Region
             }

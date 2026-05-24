@@ -8,14 +8,23 @@ The setup scripts provide two main functions:
 
 ### ✅ Create Mode
 1. ✅ Verify your GCP organization
-2. � Check for existing folders and projects (NEW!)
-3. 📁 Use existing folders OR create new folders
-4. 📦 Add projects to existing folders OR create new projects
-5. 🪣 Create a GCS state bucket per new project (naming: `{project-id}-{region}-state-{random}`)
-6. 🔧 Enable required APIs
-7. 💳 Link billing accounts
-8. 📄 Generate Terraform backend configurations
+2. 🔍 Check for existing folders and projects
+3. 🔬 **Validate existing projects** (billing, service account, bucket, versioning, lifecycle) **[NEW!]**
+4. 🔧 **Auto-repair missing resources** with retry logic **[NEW!]**
+5. 📁 Use existing folders OR create new folders
+6. 📦 Add projects to existing folders OR create new projects
+7. 🤖 **Create Infrastructure Manager service account per project** (infra-manager-sa) **[NEW!]**
+8. 🪣 Create a GCS state bucket per new project (naming: `{project-id}-{region}-state-{random}`)
+9. 🔧 Enable required APIs
+10. 💳 Link billing accounts
+11. 📄 Generate Terraform backend configurations
 
+**Reliability Features:**
+- ♻️ Automatic retry with exponential backoff for rate limits
+- ⏱️ Billing quota handling (retries with 60s delays, ~5-10 links/min limit)
+- 🔄 Versioning/lifecycle retry (up to 3 attempts with 5s delays)
+- 🕐 Smart delays between API calls to avoid quota issues
+- ✅ Clear error messages when operations fail
 ### 🗑️ Delete Mode
 1. 📋 List existing folders or projects with numerical selection
 2. ✅ Multi-select resources to delete (comma-separated: 1,3,5)
@@ -141,9 +150,9 @@ Enter new folder name: qa-environment
 Add another folder? (y/n): n
 ```
 
-### Existing Projects Detection
+### Existing Projects Detection & Validation
 
-For each folder (existing or new), the script shows existing projects:
+For each folder (existing or new), the script shows existing projects **and automatically validates their resources**:
 
 ```
 ═══════════════════════════════════════════════════════
@@ -155,12 +164,40 @@ For each folder (existing or new), the script shows existing projects:
   ─────────────────────────────────────────────────
     [1] Production Web App
         ID: prod-web-app-123
+        ✓ Complete
     [2] Production API
         ID: prod-api-456
+        ⚠️  Missing: billing, service-account, bucket
     [3] Production Database
         ID: prod-db-789
+        ⚠️  Missing: service-account-roles, versioning, lifecycle
   ─────────────────────────────────────────────────
 
+⚠ Found 2 project(s) with missing resources.
+Would you like to fix missing resources for existing projects? (y/n):
+```
+
+**What Gets Validated:**
+- ✅ **Billing**: Is billing account linked?
+- ✅ **Service Account**: Does Infrastructure Manager service account exist?
+- ✅ **IAM Roles**: Are required roles granted to service account?
+- ✅ **Bucket**: Does state bucket exist?
+- ✅ **Versioning**: Is bucket versioning enabled?
+- ✅ **Lifecycle**: Are lifecycle rules configured?
+
+**Automatic Resource Repair:**
+If you choose `y`, the script will:
+1. Link billing accounts (with quota retry logic)
+2. Create missing Infrastructure Manager service accounts
+3. Grant required IAM roles (Editor, Storage Admin, Service Account User)
+4. Create missing state buckets
+5. Enable versioning on buckets
+6. Apply lifecycle rules (30-day old version deletion)
+
+This ensures all your projects are **production-ready** with proper state management!
+
+**Then Continue with New Projects:**
+```
 Add new projects to 'production'? (y/n): y
 
 💡 Project ID Options:
@@ -367,10 +404,35 @@ After successful execution, you'll find:
 Created Resources:
 ==================
 
-Folder          FolderID        ProjectID                Bucket
-────────────────────────────────────────────────────────────────────────────────
-production      123456789       prod-web-app-123         prod-web-app-123-us-central1-state-5678
-development     987654321       dev-web-app-456          dev-web-app-456-us-central1-state-9012
+Folder          FolderID        ProjectID                ServiceAccount                                          Bucket
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+production      123456789       prod-web-app-123         infra-manager-sa@prod-web-app-123.iam.gserviceaccount.com         prod-web-app-123-us-central1-state-5678
+development     987654321       dev-web-app-456          infra-manager-sa@dev-web-app-456.iam.gserviceaccount.com          dev-web-app-456-us-central1-state-9012
+```
+
+### Service Account Details
+
+Each project gets an **Infrastructure Manager service account** with these roles:
+- 🔑 **Editor** (`roles/editor`) - Create/modify resources
+- 🪣 **Storage Admin** (`roles/storage.admin`) - Manage state bucket
+- 👤 **Service Account User** (`roles/iam.serviceAccountUser`) - Act as the service account
+
+**Using the Service Account:**
+```bash
+# Authenticate as the service account
+gcloud auth activate-service-account infra-manager-sa@PROJECT-ID.iam.gserviceaccount.com --key-file=key.json
+
+# In Terraform, reference the service account
+terraform {
+  backend "gcs" {
+    credentials = "path/to/key.json"
+  }
+}
+
+provider "google" {
+  credentials = file("path/to/key.json")
+  project     = "PROJECT-ID"
+}
 ```
 
 ## 🔧 Using the Backend Configurations
@@ -457,10 +519,78 @@ gcloud storage buckets list --project=PROJECT_ID
 - Ensure you have Billing Account Administrator role
 - Link manually: `gcloud billing projects link PROJECT_ID --billing-account=BILLING_ID`
 
+### "Billing quota exceeded"
+- **Automatic retry**: Script will automatically retry with 60-second delays (up to 3 attempts)
+- **Quota limit**: GCP limits ~5-10 project billing links per minute
+- **Solution**: Wait 5-10 minutes and run the script again to link remaining projects
+- The script will skip bucket creation for projects where billing fails, but you can manually link billing and create buckets later:
+  ```bash
+  # Link billing manually
+  gcloud billing projects link PROJECT_ID --billing-account=BILLING_ACCOUNT_ID
+  
+  # Create bucket manually
+  gcloud storage buckets create gs://PROJECT_ID-REGION-state-XXXX \
+    --project=PROJECT_ID \
+    --location=REGION \
+    --uniform-bucket-level-access \
+    --public-access-prevention
+  
+  # Enable versioning
+  gcloud storage buckets update gs://BUCKET_NAME --versioning
+  ```
+
 ### "Failed to create bucket"
 - Bucket name might conflict (unlikely with random suffix)
 - Check project has billing enabled
 - Verify Storage API is enabled
+
+### "Failed to create service account"
+- **Automatic handling**: Script continues with other resources if SA creation fails
+- **Common causes**: IAM API not enabled yet, permission issues
+- **Manual fix**: Create the service account manually:
+  ```bash
+  # Create service account
+  gcloud iam service-accounts create infra-manager-sa \
+    --display-name="Infrastructure Manager Service Account" \
+    --project=PROJECT_ID
+  
+  # Grant required roles
+  gcloud projects add-iam-policy-binding PROJECT_ID \
+    --member="serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
+    --role="roles/editor"
+  
+  gcloud projects add-iam-policy-binding PROJECT_ID \
+    --member="serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
+    --role="roles/storage.admin"
+  
+  gcloud projects add-iam-policy-binding PROJECT_ID \
+    --member="serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
+    --role="roles/iam.serviceAccountUser"
+  ```
+
+### "Failed to enable versioning" or "Failed to apply lifecycle rule"
+- **Automatic retry**: Script retries up to 3 times with 5-second delays
+- **Cause**: Bucket may not be fully propagated yet (GCS eventual consistency)
+- **Bucket propagation**: Script waits 10 seconds after bucket creation before configuring
+- **Manual fix**: If still fails, wait a few minutes and apply manually:
+  ```bash
+  # Enable versioning
+  gcloud storage buckets update gs://BUCKET_NAME --versioning
+  
+  # Add lifecycle rule (delete old versions after 30 days)
+  cat > lifecycle.json <<EOF
+  {
+    "lifecycle": {
+      "rule": [{
+        "action": {"type": "Delete"},
+        "condition": {"daysSinceNoncurrentTime": 30}
+      }]
+    }
+  }
+  EOF
+  gcloud storage buckets update gs://BUCKET_NAME --lifecycle-file=lifecycle.json
+  rm lifecycle.json
+  ```
 
 ### "Failed to delete folder"
 - Folder must be empty (no projects or sub-folders)
@@ -489,9 +619,13 @@ After setup:
 
 ## 🔐 Security Best Practices
 
+- ✅ **Infrastructure Manager service account** created per project with least-privilege roles
 - ✅ State buckets have versioning enabled (rollback capability)
 - ✅ Uniform bucket-level access enforced
 - ✅ Public access prevention enabled
+- ✅ Service account uses scoped IAM roles (Editor, Storage Admin, Service Account User)
+- 💡 **Recommendation**: Download service account keys and store securely for CI/CD pipelines
+- 💡 **Tip**: Rotate service account keys regularly (90-day rotation recommended)
 - ✅ Each project has its own isolated state bucket
 
 ## 📁 Repository Structure
