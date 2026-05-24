@@ -1,0 +1,28 @@
+# Generated files
+created-resources.json
+backend-configs/
+
+# Terraform files
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+.terraform.lock.hcl
+tfplan
+crash.log
+
+# Sensitive information
+setup-config.txt
+*.credentials
+*.key
+*.pem
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
