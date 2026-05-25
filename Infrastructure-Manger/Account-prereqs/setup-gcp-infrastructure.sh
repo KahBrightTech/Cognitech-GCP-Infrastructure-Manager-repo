@@ -467,6 +467,27 @@ check_project_resources() {
         ISSUES="${ISSUES}billing "
     fi
     
+    # Check required APIs
+    local REQUIRED_APIS=(
+        "cloudresourcemanager.googleapis.com"
+        "storage.googleapis.com"
+        "serviceusage.googleapis.com"
+        "iam.googleapis.com"
+        "config.googleapis.com"
+    )
+    
+    local ENABLED_APIS=$(gcloud services list --enabled --project="$PROJECT_ID" --format="value(config.name)" 2>/dev/null)
+    local MISSING_APIS=false
+    for API in "${REQUIRED_APIS[@]}"; do
+        if ! echo "$ENABLED_APIS" | grep -q "^$API$"; then
+            MISSING_APIS=true
+            break
+        fi
+    done
+    if [ "$MISSING_APIS" = true ]; then
+        ISSUES="${ISSUES}apis "
+    fi
+    
     # Check for Infrastructure Manager service account
     local SA_EMAIL="infra-manager-sa@$PROJECT_ID.iam.gserviceaccount.com"
     local SA_EXISTS=$(gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" --format="value(email)" 2>/dev/null)
@@ -475,7 +496,14 @@ check_project_resources() {
     else
         # Check if service account has required roles
         local SA_ROLES=$(gcloud projects get-iam-policy "$PROJECT_ID" --flatten="bindings[].members" --filter="bindings.members:serviceAccount:$SA_EMAIL" --format="value(bindings.role)" 2>/dev/null)
-        local REQUIRED_ROLES=("roles/editor" "roles/storage.admin" "roles/iam.serviceAccountUser")
+        local REQUIRED_ROLES=(
+            "roles/editor"
+            "roles/storage.admin"
+            "roles/iam.serviceAccountUser"
+            "roles/config.agent"
+            "roles/iam.securityAdmin"
+            "roles/iam.serviceAccountAdmin"
+        )
         for ROLE in "${REQUIRED_ROLES[@]}"; do
             if ! echo "$SA_ROLES" | grep -q "$ROLE"; then
                 ISSUES="${ISSUES}service-account-roles "
@@ -492,17 +520,41 @@ check_project_resources() {
     else
         BUCKET_NAME="$BUCKETS"
         
-        # Check versioning
+        # Check versioning is enabled
         local VERSIONING=$(gcloud storage buckets describe "gs://$BUCKET_NAME" --format="value(versioning.enabled)" 2>/dev/null)
         if [ "$VERSIONING" != "True" ]; then
             ISSUES="${ISSUES}versioning "
         fi
         
-        # Check lifecycle
-        local LIFECYCLE=$(gcloud storage buckets describe "gs://$BUCKET_NAME" --format="json" 2>/dev/null | grep -o '"lifecycle"')
-        if [ -z "$LIFECYCLE" ]; then
+        # Check lifecycle has correct rule: Delete action with 30 days since noncurrent
+        local LIFECYCLE_JSON=$(gcloud storage buckets describe "gs://$BUCKET_NAME" --format="json" 2>/dev/null)
+        local HAS_CORRECT_LIFECYCLE=false
+        
+        if [ -n "$LIFECYCLE_JSON" ]; then
+            # Check if lifecycle rule exists with Delete action and daysSinceNoncurrentTime = 30
+            if echo "$LIFECYCLE_JSON" | grep -q '"type": "Delete"' && \
+               echo "$LIFECYCLE_JSON" | grep -q '"daysSinceNoncurrentTime": 30'; then
+                HAS_CORRECT_LIFECYCLE=true
+            fi
+        fi
+        
+        if [ "$HAS_CORRECT_LIFECYCLE" != "true" ]; then
             ISSUES="${ISSUES}lifecycle "
         fi
+    fi
+    
+    # Check Workload Identity Federation (both pool and provider)
+    # Use list command for accurate detection - describe can return stale data
+    local WIF_POOLS=$(gcloud iam workload-identity-pools list --location=global --project="$PROJECT_ID" --format="value(name)" 2>/dev/null | grep "github-actions-pool")
+    local WIF_PROVIDER=""
+    
+    if [ -n "$WIF_POOLS" ]; then
+        # Pool exists, now check if provider exists
+        WIF_PROVIDER=$(gcloud iam workload-identity-pools providers describe github-actions-provider --workload-identity-pool=github-actions-pool --location=global --project="$PROJECT_ID" --format="value(name)" 2>/dev/null)
+    fi
+    
+    if [ -z "$WIF_POOLS" ] || [ -z "$WIF_PROVIDER" ]; then
+        ISSUES="${ISSUES}wif "
     fi
     
     echo "$ISSUES|$BUCKET_NAME"
@@ -744,6 +796,21 @@ for FOLDER in "${FOLDERS[@]}"; do
                             done
                         fi
                         
+                        # Enable required APIs
+                        print_info "Enabling required APIs..."
+                        APIS=(
+                            "cloudresourcemanager.googleapis.com"
+                            "storage.googleapis.com"
+                            "serviceusage.googleapis.com"
+                            "iam.googleapis.com"
+                            "config.googleapis.com"
+                        )
+                        
+                        for API in "${APIS[@]}"; do
+                            gcloud services enable "$API" --project="$PROJ_ID" &>/dev/null
+                        done
+                        print_success "APIs enabled"
+                        
                         # Fix missing service account
                         if echo "$ISSUES" | grep -qE "service-account"; then
                             SA_NAME="infra-manager-sa"
@@ -765,11 +832,14 @@ for FOLDER in "${FOLDERS[@]}"; do
                                 print_info "Granting IAM roles to service account..."
                             fi
                             
-                            # Grant/update IAM roles
+                            # Grant/update IAM roles at project level
                             ROLES=(
                                 "roles/editor"
                                 "roles/storage.admin"
                                 "roles/iam.serviceAccountUser"
+                                "roles/config.agent"
+                                "roles/iam.securityAdmin"
+                                "roles/iam.serviceAccountAdmin"
                             )
                             
                             for ROLE in "${ROLES[@]}"; do
@@ -779,6 +849,67 @@ for FOLDER in "${FOLDERS[@]}"; do
                                     --condition=None &>/dev/null
                             done
                             print_success "IAM roles configured"
+                            
+                            # Grant organization-level role (optional, may fail if no org permissions)
+                            print_info "Attempting to grant organization-level role for custom IAM roles..."
+                            if gcloud organizations add-iam-policy-binding "$ORGANIZATION_ID" \
+                                --member="serviceAccount:$SA_EMAIL" \
+                                --role="roles/iam.organizationRoleAdmin" \
+                                --condition=None &>/dev/null; then
+                                print_success "Organization-level role granted"
+                            else
+                                print_warning "Could not grant organization-level role (this may require additional permissions)"
+                            fi
+                            
+                            # Configure Workload Identity Federation for GitHub Actions
+                            print_info "Setting up Workload Identity Federation for GitHub Actions..."
+                            POOL_ID="github-actions-pool"
+                            PROVIDER_ID="github-actions-provider"
+                            
+                            # Get project number (required for workload identity)
+                            PROJECT_NUMBER=$(gcloud projects describe "$PROJ_ID" --format="value(projectNumber)" 2>/dev/null)
+                            
+                            if [ -n "$PROJECT_NUMBER" ]; then
+                                # Create Workload Identity Pool
+                                POOL_RESULT=$(gcloud iam workload-identity-pools create "$POOL_ID" \
+                                    --project="$PROJ_ID" \
+                                    --location="global" \
+                                    --display-name="GitHub Actions Pool" \
+                                    --description="Workload Identity Pool for GitHub Actions authentication" 2>&1)
+                                
+                                if [ $? -eq 0 ] || echo "$POOL_RESULT" | grep -q "already exists"; then
+                                    if echo "$POOL_RESULT" | grep -q "already exists"; then
+                                        print_info "Workload Identity Pool already exists"
+                                    else
+                                        print_success "Workload Identity Pool created"
+                                    fi
+                                    
+                                    # Create GitHub OIDC Provider
+                                    PROVIDER_RESULT=$(gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" \
+                                        --project="$PROJ_ID" \
+                                        --location="global" \
+                                        --workload-identity-pool="$POOL_ID" \
+                                        --display-name="GitHub Actions Provider" \
+                                        --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository" \
+                                        --issuer-uri="https://token.actions.githubusercontent.com" 2>&1)
+                                    
+                                    if [ $? -eq 0 ] || echo "$PROVIDER_RESULT" | grep -q "already exists"; then
+                                        if echo "$PROVIDER_RESULT" | grep -q "already exists"; then
+                                            print_info "Workload Identity Provider already exists"
+                                        else
+                                            print_success "Workload Identity Provider created"
+                                        fi
+                                        
+                                        # Grant workload identity permission to impersonate service account
+                                        if gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+                                            --project="$PROJ_ID" \
+                                            --role="roles/iam.workloadIdentityUser" \
+                                            --member="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL_ID/attribute.repository/*" &>/dev/null; then
+                                            print_success "Workload Identity configured"
+                                        fi
+                                    fi
+                                fi
+                            fi
                         fi
                         
                         # Fix missing bucket
@@ -872,6 +1003,83 @@ EOF
                             done
                             
                             rm -f "$TEMP_LIFECYCLE_FILE"
+                        fi
+                        
+                        # Fix Workload Identity Federation
+                        if echo "$ISSUES" | grep -q "wif"; then
+                            print_info "Setting up Workload Identity Federation for GitHub Actions..."
+                            POOL_ID="github-actions-pool"
+                            PROVIDER_ID="github-actions-provider"
+                            SA_EMAIL="infra-manager-sa@$PROJ_ID.iam.gserviceaccount.com"
+                            
+                            # Get project number (required for workload identity)
+                            PROJECT_NUMBER=$(gcloud projects describe "$PROJ_ID" --format="value(projectNumber)" 2>/dev/null)
+                            
+                            if [ -n "$PROJECT_NUMBER" ]; then
+                                # Create Workload Identity Pool
+                                POOL_RESULT=$(gcloud iam workload-identity-pools create "$POOL_ID" \
+                                    --project="$PROJ_ID" \
+                                    --location="global" \
+                                    --display-name="GitHub Actions Pool" \
+                                    --description="Workload Identity Pool for GitHub Actions authentication" 2>&1)
+                                
+                                if [ $? -eq 0 ] || echo "$POOL_RESULT" | grep -q "already exists"; then
+                                    if echo "$POOL_RESULT" | grep -q "already exists"; then
+                                        print_info "Workload Identity Pool already exists"
+                                    else
+                                        print_success "Workload Identity Pool created"
+                                    fi
+                                    
+                                    # Check if provider already exists
+                                    EXISTING_PROVIDER=$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+                                        --workload-identity-pool="$POOL_ID" \
+                                        --location="global" \
+                                        --project="$PROJ_ID" \
+                                        --format="value(name)" 2>/dev/null)
+                                    
+                                    if [ -z "$EXISTING_PROVIDER" ]; then
+                                        # Create GitHub OIDC Provider with standard claims
+                                        PROVIDER_RESULT=$(gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" \
+                                            --project="$PROJ_ID" \
+                                            --location="global" \
+                                            --workload-identity-pool="$POOL_ID" \
+                                            --display-name="GitHub Actions Provider" \
+                                            --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository" \
+                                            --issuer-uri="https://token.actions.githubusercontent.com" 2>&1)
+                                    else
+                                        PROVIDER_RESULT="already exists"
+                                    fi
+                                    
+                                    if [ $? -eq 0 ] || echo "$PROVIDER_RESULT" | grep -q "already exists"; then
+                                        if echo "$PROVIDER_RESULT" | grep -q "already exists"; then
+                                            print_info "Workload Identity Provider already exists"
+                                        else
+                                            print_success "Workload Identity Provider created"
+                                        fi
+                                        
+                                        # Grant workload identity permission to impersonate service account
+                                        WIF_BINDING_RESULT=$(gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+                                            --project="$PROJ_ID" \
+                                            --role="roles/iam.workloadIdentityUser" \
+                                            --member="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL_ID/attribute.repository/*" 2>&1)
+                                        
+                                        if [ $? -eq 0 ]; then
+                                            print_success "Workload Identity configured"
+                                        else
+                                            print_warning "Failed to grant workload identity permissions"
+                                            echo -e "${RED}Error details: $WIF_BINDING_RESULT${NC}"
+                                        fi
+                                    else
+                                        print_warning "Failed to create workload identity provider"
+                                        echo -e "${RED}Error details: $PROVIDER_RESULT${NC}"
+                                    fi
+                                else
+                                    print_warning "Failed to create workload identity pool"
+                                    echo -e "${RED}Error details: $POOL_RESULT${NC}"
+                                fi
+                            else
+                                print_warning "Could not retrieve project number for workload identity setup"
+                            fi
                         fi
                         
                         print_success "Completed fixes for $PROJ_ID\n"
@@ -1136,6 +1344,7 @@ for FOLDER in "${FOLDERS[@]}"; do
             "storage.googleapis.com"
             "serviceusage.googleapis.com"
             "iam.googleapis.com"
+            "config.googleapis.com"
         )
         
         for API in "${APIS[@]}"; do
@@ -1154,12 +1363,15 @@ for FOLDER in "${FOLDERS[@]}"; do
             --project="$PROJECT_ID" 2>/dev/null; then
             print_success "Service account created: $SA_EMAIL"
             
-            # Grant required IAM roles
+            # Grant required IAM roles at project level
             print_info "Granting IAM roles to service account..."
             ROLES=(
                 "roles/editor"
                 "roles/storage.admin"
                 "roles/iam.serviceAccountUser"
+                "roles/config.agent"
+                "roles/iam.securityAdmin"
+                "roles/iam.serviceAccountAdmin"
             )
             
             for ROLE in "${ROLES[@]}"; do
@@ -1168,7 +1380,103 @@ for FOLDER in "${FOLDERS[@]}"; do
                     --role="$ROLE" \
                     --condition=None &>/dev/null
             done
-            print_success "IAM roles granted (Editor, Storage Admin, Service Account User)"
+            print_success "IAM roles granted (Editor, Storage Admin, Config Agent, IAM Admin)"
+            
+            # Grant organization-level role (optional, may fail if no org permissions)
+            print_info "Attempting to grant organization-level role for custom IAM roles..."
+            if gcloud organizations add-iam-policy-binding "$ORGANIZATION_ID" \
+                --member="serviceAccount:$SA_EMAIL" \
+                --role="roles/iam.organizationRoleAdmin" \
+                --condition=None &>/dev/null; then
+                print_success "Organization-level role granted"
+            else
+                print_warning "Could not grant organization-level role (this may require additional permissions)"
+            fi
+            
+            # Configure Workload Identity Federation for GitHub Actions
+            print_info "Setting up Workload Identity Federation for GitHub Actions..."
+            POOL_ID="github-actions-pool"
+            PROVIDER_ID="github-actions-provider"
+            
+            # Get project number (required for workload identity)
+            PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null)
+            
+            if [ -n "$PROJECT_NUMBER" ]; then
+                # Create Workload Identity Pool
+                POOL_RESULT=$(gcloud iam workload-identity-pools create "$POOL_ID" \
+                    --project="$PROJECT_ID" \
+                    --location="global" \
+                    --display-name="GitHub Actions Pool" \
+                    --description="Workload Identity Pool for GitHub Actions authentication" 2>&1)
+                
+                if [ $? -eq 0 ] || echo "$POOL_RESULT" | grep -q "already exists"; then
+                    if echo "$POOL_RESULT" | grep -q "already exists"; then
+                        print_success "Workload Identity Pool already exists: $POOL_ID"
+                    else
+                        print_success "Workload Identity Pool created: $POOL_ID"
+                        # Wait for pool to propagate
+                        print_info "Waiting for pool to propagate..."
+                        sleep 5
+                    fi
+                    
+                    # Check if provider already exists
+                    EXISTING_PROVIDER=$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+                        --workload-identity-pool="$POOL_ID" \
+                        --location="global" \
+                        --project="$PROJECT_ID" \
+                        --format="value(name)" 2>/dev/null)
+                    
+                    if [ -z "$EXISTING_PROVIDER" ]; then
+                        # Create GitHub OIDC Provider with standard claims
+                        PROVIDER_RESULT=$(gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" \
+                            --project="$PROJECT_ID" \
+                            --location="global" \
+                            --workload-identity-pool="$POOL_ID" \
+                            --display-name="GitHub Actions Provider" \
+                            --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository" \
+                            --issuer-uri="https://token.actions.githubusercontent.com" 2>&1)
+                    else
+                        PROVIDER_RESULT="already exists"
+                    fi
+                    
+                    if echo "$PROVIDER_RESULT" | grep -q "already exists"; then
+                            print_success "Workload Identity Provider already exists: $PROVIDER_ID"
+                        else
+                            print_success "Workload Identity Provider created: $PROVIDER_ID"
+                        fi
+                        
+                        # Grant workload identity permission to impersonate service account
+                        print_info "Granting workload identity permissions..."
+                        WIF_BINDING_RESULT=$(gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+                            --project="$PROJECT_ID" \
+                            --role="roles/iam.workloadIdentityUser" \
+                            --member="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL_ID/attribute.repository/*" 2>&1)
+                        
+                        if [ $? -eq 0 ]; then
+                            print_success "Workload Identity configured for GitHub Actions"
+                            echo ""
+                            echo -e "${CYAN}  📝 GitHub Actions Configuration:${NC}"
+                            echo -e "${GRAY}  ─────────────────────────────────────────────────${NC}"
+                            echo -e "${GRAY}  Workload Identity Provider:${NC}"
+                            echo -e "    projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL_ID/providers/$PROVIDER_ID"
+                            echo -e "${GRAY}  Service Account:${NC}"
+                            echo -e "    $SA_EMAIL"
+                            echo ""
+                        else
+                            print_warning "Failed to grant workload identity permissions"
+                            echo -e "${RED}Error details: $WIF_BINDING_RESULT${NC}"
+                        fi
+                    else
+                        print_warning "Failed to create workload identity provider"
+                        echo -e "${RED}Error details: $PROVIDER_RESULT${NC}"
+                    fi
+                else
+                    print_warning "Failed to create workload identity pool"
+                    echo -e "${RED}Error details: $POOL_RESULT${NC}"
+                fi
+            else
+                print_warning "Could not retrieve project number for workload identity setup"
+            fi
         else
             print_warning "Failed to create service account"
             print_info "You can create it manually later with: gcloud iam service-accounts create $SA_NAME --project=$PROJECT_ID"

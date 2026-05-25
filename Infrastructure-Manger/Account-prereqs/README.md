@@ -13,11 +13,15 @@ The setup scripts provide two main functions:
 4. 🔧 **Auto-repair missing resources** with retry logic **[NEW!]**
 5. 📁 Use existing folders OR create new folders
 6. 📦 Add projects to existing folders OR create new projects
-7. 🤖 **Create Infrastructure Manager service account per project** (infra-manager-sa) **[NEW!]**
-8. 🪣 Create a GCS state bucket per new project (naming: `{project-id}-{region}-state-{random}`)
-9. 🔧 Enable required APIs
-10. 💳 Link billing accounts
-11. 📄 Generate Terraform backend configurations
+7. 💳 Link billing accounts
+8. 🔌 **Enable required GCP APIs** for Infrastructure Manager and resource management
+9. 🤖 **Create Infrastructure Manager service account per project** (infra-manager-sa)
+10. 🔑 **Grant comprehensive IAM roles** at project and organization levels
+11. 🔐 **Configure Workload Identity Federation** for keyless GitHub Actions authentication **[NEW!]**
+12. 🪣 Create a GCS state bucket per new project (naming: `{project-id}-{region}-state-{random}`)
+13. 🔄 Enable bucket versioning for state rollback capability
+14. ♻️ Configure lifecycle rules for old version cleanup
+15. 📄 Generate Terraform backend configurations
 
 **Reliability Features:**
 - ♻️ Automatic retry with exponential backoff for rate limits
@@ -35,6 +39,155 @@ The setup scripts provide two main functions:
 - Requires typing `DELETE` (case-sensitive) to confirm
 - Shows full details before deletion
 - Cannot be undone - use with caution!
+
+## 🏗️ Resource Preparation Details
+
+The script prepares your GCP projects for Infrastructure Manager deployments by setting up all necessary prerequisites:
+
+### 1. **API Enablement** 🔌
+Enables the following APIs in each project:
+- `cloudresourcemanager.googleapis.com` - Manage projects, folders, and organizations
+- `storage.googleapis.com` - GCS bucket operations for state storage
+- `serviceusage.googleapis.com` - Enable/disable APIs programmatically
+- `iam.googleapis.com` - Identity and Access Management
+- `config.googleapis.com` - **Infrastructure Manager API** for deployment operations
+
+### 2. **Service Account Creation** 🤖
+Creates an Infrastructure Manager service account per project:
+- **Name**: `infra-manager-sa`
+- **Email**: `infra-manager-sa@{project-id}.iam.gserviceaccount.com`
+- **Purpose**: Dedicated identity for Infrastructure Manager to deploy and manage resources
+
+### 3. **Project-Level IAM Roles** 🔑
+Grants 6 comprehensive roles to the service account:
+
+| Role | Permission | Why Needed |
+|------|-----------|------------|
+| `roles/editor` | Create/modify GCP resources | Deploy infrastructure components |
+| `roles/storage.admin` | Full bucket management | Manage Terraform state in GCS |
+| `roles/iam.serviceAccountUser` | Use service accounts | Assign service accounts to resources |
+| `roles/config.agent` | Infrastructure Manager operations | Create and manage deployments |
+| `roles/iam.securityAdmin` | Manage IAM policies & roles | Create custom IAM roles and bindings |
+| `roles/iam.serviceAccountAdmin` | Create service accounts | Deploy workload identities |
+
+### 4. **Organization-Level IAM Roles** 🏢
+Grants organization-wide permission (if you have org admin access):
+
+| Role | Permission | Why Needed |
+|------|-----------|------------|
+| `roles/iam.organizationRoleAdmin` | Create custom roles at org level | Define organization-wide custom IAM roles |
+
+**Note**: If you lack organization admin permissions, this will show a warning but won't block deployment. You can still create project-level custom roles.
+
+### 5. **Workload Identity Federation** 🔐
+Configures keyless authentication for GitHub Actions:
+
+**What Gets Created:**
+- **Workload Identity Pool**: `github-actions-pool`
+  - Global location
+  - Dedicated pool per project for isolation
+
+- **Workload Identity Provider**: `github-actions-provider`
+  - OIDC provider for GitHub Actions
+  - Issuer: `https://token.actions.githubusercontent.com`
+  - Attribute mappings:
+    - `google.subject` → `assertion.sub`
+    - `attribute.actor` → `assertion.actor`
+    - `attribute.repository` → `assertion.repository`
+
+- **IAM Binding**: Grants `roles/iam.workloadIdentityUser` to the pool
+  - Allows any GitHub repository to authenticate (can be restricted later)
+  - Service account impersonation permission
+
+**Benefits:**
+- ✅ **No service account keys** - Eliminates key management and rotation
+- ✅ **Short-lived tokens** - GitHub generates temporary credentials
+- ✅ **Automatic rotation** - Tokens expire after ~10 minutes
+- ✅ **Audit trail** - All actions logged with GitHub identity
+- ✅ **Fine-grained control** - Restrict by repository, branch, environment
+
+**GitHub Actions Usage:**
+The script outputs the configuration you need:
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to GCP
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write  # Required for OIDC
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider'
+          service_account: 'infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com'
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Deploy with Terraform
+        run: |
+          terraform init
+          terraform plan
+          terraform apply -auto-approve
+```
+
+**Restrict to Specific Repository (Recommended):**
+After setup, tighten security by restricting to your repository:
+```bash
+# Remove the wildcard binding
+gcloud iam service-accounts remove-iam-policy-binding \
+  infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com \
+  --project=PROJECT_ID \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-actions-pool/attribute.repository/*"
+
+# Add repository-specific binding
+gcloud iam service-accounts add-iam-policy-binding \
+  infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com \
+  --project=PROJECT_ID \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-actions-pool/attribute.repository/YOUR_ORG/YOUR_REPO"
+```
+
+### 6. **State Storage Bucket** 🪣
+Creates a GCS bucket per project for Terraform state:
+- **Naming**: `{project-id}-{region}-state-{random}`
+- **Versioning**: Enabled (protects against state corruption)
+- **Lifecycle**: Deletes versions older than 30 days (prevents unbounded growth)
+- **Access**: Uniform bucket-level access with public access prevention
+- **Purpose**: Centralized, secure storage for Terraform state files
+
+### 7. **Backend Configuration** 📄
+Generates Terraform backend configs:
+- **Location**: `backend-configs/backend-{project-id}.tf`
+- **Format**: Ready-to-use Terraform HCL
+- **Purpose**: Drop into your Terraform directory and run `terraform init`
+
+### 8. **Resource Inventory** 📊
+Creates a JSON inventory of all resources:
+- **Location**: `created-resources.json`
+- **Contents**: Folders, projects, service accounts, buckets
+- **Purpose**: Audit trail and quick reference
+
+### ✅ Result: Production-Ready Projects
+After running the script, each project is fully prepared for Infrastructure Manager with:
+- ✅ All APIs enabled
+- ✅ Dedicated service account with comprehensive permissions
+- ✅ Workload Identity Federation configured for CI/CD
+- ✅ Secure state storage with versioning
+- ✅ Ready-to-use backend configurations
+- ✅ Billing linked and active
 
 ## 🚀 Quick Start
 
@@ -179,8 +332,9 @@ Would you like to fix missing resources for existing projects? (y/n):
 
 **What Gets Validated:**
 - ✅ **Billing**: Is billing account linked?
+- ✅ **APIs**: Are all required APIs enabled (Cloud Resource Manager, Storage, Service Usage, IAM, Infrastructure Manager)?
 - ✅ **Service Account**: Does Infrastructure Manager service account exist?
-- ✅ **IAM Roles**: Are required roles granted to service account?
+- ✅ **IAM Roles**: Are all 6 required roles granted to service account?
 - ✅ **Bucket**: Does state bucket exist?
 - ✅ **Versioning**: Is bucket versioning enabled?
 - ✅ **Lifecycle**: Are lifecycle rules configured?
@@ -188,11 +342,20 @@ Would you like to fix missing resources for existing projects? (y/n):
 **Automatic Resource Repair:**
 If you choose `y`, the script will:
 1. Link billing accounts (with quota retry logic)
-2. Create missing Infrastructure Manager service accounts
-3. Grant required IAM roles (Editor, Storage Admin, Service Account User)
-4. Create missing state buckets
-5. Enable versioning on buckets
-6. Apply lifecycle rules (30-day old version deletion)
+2. **Enable required APIs** (cloudresourcemanager, storage, serviceusage, iam, config)
+3. Create missing Infrastructure Manager service accounts
+4. **Grant comprehensive IAM roles** at project level:
+   - `roles/editor` - Create and modify GCP resources
+   - `roles/storage.admin` - Manage state buckets
+   - `roles/iam.serviceAccountUser` - Use service accounts
+   - `roles/config.agent` - Infrastructure Manager agent permissions
+   - `roles/iam.securityAdmin` - Manage IAM policies and roles
+   - `roles/iam.serviceAccountAdmin` - Create and manage service accounts
+5. **Grant organization-level permissions** (if you have org admin access):
+   - `roles/iam.organizationRoleAdmin` - Create custom IAM roles at organization level
+6. Create missing state buckets
+7. Enable versioning on buckets
+8. Apply lifecycle rules (30-day old version deletion)
 
 This ensures all your projects are **production-ready** with proper state management!
 
@@ -412,10 +575,25 @@ development     987654321       dev-web-app-456          infra-manager-sa@dev-we
 
 ### Service Account Details
 
-Each project gets an **Infrastructure Manager service account** with these roles:
-- 🔑 **Editor** (`roles/editor`) - Create/modify resources
-- 🪣 **Storage Admin** (`roles/storage.admin`) - Manage state bucket
-- 👤 **Service Account User** (`roles/iam.serviceAccountUser`) - Act as the service account
+Each project gets an **Infrastructure Manager service account** (`infra-manager-sa`) with comprehensive permissions:
+
+**Project-Level Roles:**
+- 🔑 **Editor** (`roles/editor`) - Create/modify GCP resources
+- 🪣 **Storage Admin** (`roles/storage.admin`) - Manage state buckets
+- 👤 **Service Account User** (`roles/iam.serviceAccountUser`) - Use service accounts for deployments
+- 🏗️ **Config Agent** (`roles/config.agent`) - Infrastructure Manager agent operations
+- 🔐 **IAM Security Admin** (`roles/iam.securityAdmin`) - Manage IAM policies, bindings, and custom roles
+- 👥 **IAM Service Account Admin** (`roles/iam.serviceAccountAdmin`) - Create and manage service accounts
+
+**Organization-Level Roles:**
+- 🏢 **Organization Role Admin** (`roles/iam.organizationRoleAdmin`) - Create custom IAM roles at organization scope
+
+**Why These Permissions?**
+- **Infrastructure Manager** requires `config.agent` to create and manage deployments
+- **Custom IAM Roles** require `iam.securityAdmin` and `iam.organizationRoleAdmin` for creation
+- **Service Account Management** requires `iam.serviceAccountAdmin` for creating workload identities
+- **Resource Creation** requires `editor` for deploying infrastructure
+- **State Management** requires `storage.admin` for backend operations
 
 **Using the Service Account:**
 ```bash
@@ -487,8 +665,9 @@ Buckets are automatically named with this pattern:
 
 ## 🔍 Verifying Resources
 
-Check created resources using gcloud:
+Check created resources and confirm everything is properly configured:
 
+### Verify Project Structure
 ```bash
 # List folders
 gcloud resource-manager folders list --organization=YOUR_ORG_ID
@@ -496,8 +675,181 @@ gcloud resource-manager folders list --organization=YOUR_ORG_ID
 # List projects in a folder
 gcloud projects list --filter="parent.id=FOLDER_ID"
 
-# List buckets in a project
+# Check billing is linked
+gcloud billing projects describe PROJECT_ID
+```
+
+### Verify APIs are Enabled
+```bash
+# List all enabled APIs
+gcloud services list --enabled --project=PROJECT_ID
+
+# Check specific required APIs
+gcloud services list --enabled --project=PROJECT_ID \
+  --filter="config.name:(cloudresourcemanager.googleapis.com OR storage.googleapis.com OR serviceusage.googleapis.com OR iam.googleapis.com OR config.googleapis.com)" \
+  --format="table(config.name)"
+```
+
+### Verify Service Account
+```bash
+# Check service account exists
+gcloud iam service-accounts describe infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com \
+  --project=PROJECT_ID
+
+# List all service accounts in project
+gcloud iam service-accounts list --project=PROJECT_ID
+```
+
+### Verify Project-Level IAM Permissions
+```bash
+# Check all roles granted to service account
+gcloud projects get-iam-policy PROJECT_ID \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
+  --format="table(bindings.role)"
+
+# Expected output (6 roles):
+# roles/config.agent
+# roles/editor
+# roles/iam.securityAdmin
+# roles/iam.serviceAccountAdmin
+# roles/iam.serviceAccountUser
+# roles/storage.admin
+```
+
+### Verify Organization-Level IAM Permissions
+```bash
+# Check organization-level role
+gcloud organizations get-iam-policy ORG_ID \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
+  --format="table(bindings.role)"
+
+# Expected output:
+# roles/iam.organizationRoleAdmin
+```
+
+### Verify State Buckets
+```bash
+# List buckets in project
 gcloud storage buckets list --project=PROJECT_ID
+
+# Check specific bucket configuration
+gcloud storage buckets describe gs://BUCKET_NAME
+
+# Verify versioning is enabled
+gcloud storage buckets describe gs://BUCKET_NAME --format="value(versioning.enabled)"
+# Expected output: True
+
+# Check lifecycle rules exist
+gcloud storage buckets describe gs://BUCKET_NAME --format="json" | grep -A 10 "lifecycle"
+```
+
+### Verify Workload Identity Federation
+```bash
+# List workload identity pools
+gcloud iam workload-identity-pools list --location=global --project=PROJECT_ID
+
+# Get details of the GitHub Actions pool
+gcloud iam workload-identity-pools describe github-actions-pool \
+  --location=global \
+  --project=PROJECT_ID
+
+# List providers in the pool
+gcloud iam workload-identity-pools providers list \
+  --workload-identity-pool=github-actions-pool \
+  --location=global \
+  --project=PROJECT_ID
+
+# Check provider configuration
+gcloud iam workload-identity-pools providers describe github-actions-provider \
+  --workload-identity-pool=github-actions-pool \
+  --location=global \
+  --project=PROJECT_ID
+
+# Verify service account binding
+gcloud iam service-accounts get-iam-policy \
+  infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com \
+  --project=PROJECT_ID \
+  --format=json | grep -A 5 workloadIdentityUser
+```
+
+### Quick Verification Script
+```bash
+# PowerShell - Check all projects at once
+$projects = @("dev-project-1430", "sit-project-2001", "shared-project-8952")
+
+foreach ($project in $projects) {
+    Write-Host "`n=== Verifying $project ===" -ForegroundColor Cyan
+    
+    # Check APIs
+    Write-Host "APIs:" -ForegroundColor Yellow
+    gcloud services list --enabled --project=$project --filter="config.name:config.googleapis.com" --format="value(config.name)"
+    
+    # Check Service Account
+    Write-Host "Service Account:" -ForegroundColor Yellow
+    gcloud iam service-accounts describe "infra-manager-sa@$project.iam.gserviceaccount.com" --project=$project --format="value(email)" 2>$null
+    
+    # Check Permissions
+    Write-Host "IAM Roles:" -ForegroundColor Yellow
+    gcloud projects get-iam-policy $project --flatten="bindings[].members" --filter="bindings.members:serviceAccount:infra-manager-sa@$project.iam.gserviceaccount.com" --format="value(bindings.role)"
+    
+    # Check Workload Identity
+    Write-Host "Workload Identity Pool:" -ForegroundColor Yellow
+    gcloud iam workload-identity-pools describe github-actions-pool --location=global --project=$project --format="value(name)" 2>$null
+    
+    # Check Bucket
+    Write-Host "State Bucket:" -ForegroundColor Yellow
+    gcloud storage buckets list --project=$project --format="value(name)" | Select-String "$project.*state"
+}
+```
+
+### Bash Verification Script
+```bash
+#!/bin/bash
+projects=("dev-project-1430" "sit-project-2001" "shared-project-8952")
+
+for project in "${projects[@]}"; do
+    echo -e "\n=== Verifying $project ==="
+    
+    # Check APIs
+    echo "APIs:"
+    gcloud services list --enabled --project="$project" --filter="config.name:config.googleapis.com" --format="value(config.name)"
+    
+    # Check Service Account
+    echo "Service Account:"
+    gcloud iam service-accounts describe "infra-manager-sa@$project.iam.gserviceaccount.com" --project="$project" --format="value(email)" 2>/dev/null
+    
+    # Check Permissions
+    echo "IAM Roles:"
+    gcloud projects get-iam-policy "$project" --flatten="bindings[].members" --filter="bindings.members:serviceAccount:infra-manager-sa@$project.iam.gserviceaccount.com" --format="value(bindings.role)"
+    
+    # Check Workload Identity
+    echo "Workload Identity Pool:"
+    gcloud iam workload-identity-pools describe github-actions-pool --location=global --project="$project" --format="value(name)" 2>/dev/null
+    
+    # Check Bucket
+    echo "State Bucket:"
+    gcloud storage buckets list --project="$project" --format="value(name)" | grep "$project.*state"
+done
+```
+    
+    # Check APIs
+    echo "APIs:"
+    gcloud services list --enabled --project=$project --filter="config.name:config.googleapis.com" --format="value(config.name)"
+    
+    # Check Service Account
+    echo "Service Account:"
+    gcloud iam service-accounts describe "infra-manager-sa@$project.iam.gserviceaccount.com" --project=$project --format="value(email)" 2>/dev/null
+    
+    # Check Permissions
+    echo "IAM Roles:"
+    gcloud projects get-iam-policy $project --flatten="bindings[].members" --filter="bindings.members:serviceAccount:infra-manager-sa@$project.iam.gserviceaccount.com" --format="value(bindings.role)"
+    
+    # Check Bucket
+    echo "State Bucket:"
+    gcloud storage buckets list --project=$project --format="value(name)" | grep "$project.*state"
+done
 ```
 
 ## 🆘 Troubleshooting
@@ -554,19 +906,24 @@ gcloud storage buckets list --project=PROJECT_ID
     --display-name="Infrastructure Manager Service Account" \
     --project=PROJECT_ID
   
-  # Grant required roles
-  gcloud projects add-iam-policy-binding PROJECT_ID \
-    --member="serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/editor"
+  # Grant project-level roles
+  for role in "roles/editor" "roles/storage.admin" "roles/iam.serviceAccountUser" "roles/config.agent" "roles/iam.securityAdmin" "roles/iam.serviceAccountAdmin"; do
+    gcloud projects add-iam-policy-binding PROJECT_ID \
+      --member="serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
+      --role="$role"
+  done
   
-  gcloud projects add-iam-policy-binding PROJECT_ID \
+  # Grant organization-level role (requires org admin permissions)
+  gcloud organizations add-iam-policy-binding ORG_ID \
     --member="serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/storage.admin"
-  
-  gcloud projects add-iam-policy-binding PROJECT_ID \
-    --member="serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/iam.serviceAccountUser"
+    --role="roles/iam.organizationRoleAdmin"
   ```
+
+### "Could not grant organization-level role"
+- **Expected behavior**: This is a warning, not an error
+- **Cause**: You may not have Organization Admin permissions
+- **Impact**: Service account can still create project-level resources, but cannot create organization-level custom IAM roles
+- **Fix**: Ask your Organization Admin to grant the role, or accept the limitation if you don't need custom org-level roles
 
 ### "Failed to enable versioning" or "Failed to apply lifecycle rule"
 - **Automatic retry**: Script retries up to 3 times with 5-second delays
@@ -619,14 +976,44 @@ After setup:
 
 ## 🔐 Security Best Practices
 
-- ✅ **Infrastructure Manager service account** created per project with least-privilege roles
-- ✅ State buckets have versioning enabled (rollback capability)
-- ✅ Uniform bucket-level access enforced
-- ✅ Public access prevention enabled
-- ✅ Service account uses scoped IAM roles (Editor, Storage Admin, Service Account User)
-- 💡 **Recommendation**: Download service account keys and store securely for CI/CD pipelines
+### Service Account Security
+- ✅ **Dedicated service account per project** with scoped permissions
+- ✅ **Six project-level roles** for Infrastructure Manager operations:
+  - Editor, Storage Admin, Service Account User, Config Agent, IAM Security Admin, Service Account Admin
+- ✅ **Organization-level role** for custom IAM role creation (optional)
+- 💡 **Recommendation**: Download service account keys and store securely in secret managers (Azure Key Vault, GCP Secret Manager, HashiCorp Vault)
 - 💡 **Tip**: Rotate service account keys regularly (90-day rotation recommended)
-- ✅ Each project has its own isolated state bucket
+- 🔒 **Principle of Least Privilege**: Roles are scoped to only what Infrastructure Manager needs
+
+### State Storage Security
+- ✅ State buckets have **versioning enabled** (rollback capability for state corruption)
+- ✅ **Uniform bucket-level access** enforced (no per-object ACLs)
+- ✅ **Public access prevention** enabled (blocks accidental public exposure)
+- ✅ **Lifecycle rules** configured (automatically delete old versions after 30 days)
+- ✅ Each project has its own **isolated state bucket** (blast radius containment)
+
+### API Security
+- ✅ **Required APIs only** enabled (cloudresourcemanager, storage, serviceusage, iam, config)
+- 💡 **Tip**: Regularly audit enabled APIs and disable unused ones
+
+### Verification Commands
+```bash
+# Check service account permissions
+gcloud projects get-iam-policy PROJECT_ID \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
+  --format="table(bindings.role)"
+
+# Check organization-level permissions
+gcloud organizations get-iam-policy ORG_ID \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:serviceAccount:infra-manager-sa@PROJECT_ID.iam.gserviceaccount.com" \
+  --format="table(bindings.role)"
+
+# Check enabled APIs
+gcloud services list --enabled --project=PROJECT_ID \
+  --format="table(config.name)"
+```
 
 ## 📁 Repository Structure
 
