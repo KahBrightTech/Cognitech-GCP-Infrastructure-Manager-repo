@@ -4,14 +4,14 @@
 
 # Project IAM Bindings
 resource "google_project_iam_binding" "project_bindings" {
-  for_each = var.iam.project_iam_bindings
+  for_each = var.iam.project_iam_bindings != null ? var.iam.project_iam_bindings : {}
 
   project = var.iam.project_id
   role    = each.key
   members = each.value
 
   dynamic "condition" {
-    for_each = var.iam.iam_binding_conditions[each.key] != null ? [var.iam.iam_binding_conditions[each.key]] : []
+    for_each = var.iam.iam_binding_conditions != null && var.iam.iam_binding_conditions[each.key] != null ? [var.iam.iam_binding_conditions[each.key]] : []
     content {
       title       = condition.value.title
       description = condition.value.description
@@ -22,7 +22,7 @@ resource "google_project_iam_binding" "project_bindings" {
 
 # Project IAM Members (Additive - doesn't replace existing bindings)
 resource "google_project_iam_member" "project_members" {
-  for_each = var.iam.project_iam_members
+  for_each = var.iam.project_iam_members != null ? var.iam.project_iam_members : {}
 
   project = var.iam.project_id
   role    = each.value.role
@@ -40,7 +40,7 @@ resource "google_project_iam_member" "project_members" {
 
 # Custom IAM Roles
 resource "google_project_iam_custom_role" "custom_roles" {
-  for_each = var.iam.custom_roles
+  for_each = var.iam.custom_roles != null ? var.iam.custom_roles : {}
 
   project     = var.iam.project_id
   role_id     = each.key
@@ -52,7 +52,7 @@ resource "google_project_iam_custom_role" "custom_roles" {
 
 # Service Accounts
 resource "google_service_account" "service_accounts" {
-  for_each = var.iam.service_accounts
+  for_each = var.iam.service_accounts != null ? var.iam.service_accounts : {}
 
   project      = var.iam.project_id
   account_id   = each.key
@@ -63,7 +63,7 @@ resource "google_service_account" "service_accounts" {
 
 # Service Account IAM Bindings
 resource "google_service_account_iam_binding" "sa_bindings" {
-  for_each = var.iam.service_account_iam_bindings
+  for_each = var.iam.service_account_iam_bindings != null ? var.iam.service_account_iam_bindings : {}
 
   service_account_id = google_service_account.service_accounts[each.value.service_account_key].name
   role               = each.value.role
@@ -72,7 +72,7 @@ resource "google_service_account_iam_binding" "sa_bindings" {
 
 # Service Account Keys (Use with caution - prefer Workload Identity)
 resource "google_service_account_key" "sa_keys" {
-  for_each = var.iam.create_service_account_keys
+  for_each = var.iam.create_service_account_keys != null ? var.iam.create_service_account_keys : {}
 
   service_account_id = google_service_account.service_accounts[each.key].name
   key_algorithm      = lookup(each.value, "key_algorithm", "KEY_ALG_RSA_2048")
@@ -81,7 +81,7 @@ resource "google_service_account_key" "sa_keys" {
 
 # Organization IAM Bindings (if organization_id is provided)
 resource "google_organization_iam_binding" "org_bindings" {
-  for_each = var.iam.organization_id != null ? var.iam.organization_iam_bindings : {}
+  for_each = var.iam.organization_id != null && var.iam.organization_iam_bindings != null ? var.iam.organization_iam_bindings : {}
 
   org_id  = var.iam.organization_id
   role    = each.key
@@ -90,7 +90,7 @@ resource "google_organization_iam_binding" "org_bindings" {
 
 # Folder IAM Bindings (if folder_ids are provided)
 resource "google_folder_iam_binding" "folder_bindings" {
-  for_each = var.iam.folder_iam_bindings
+  for_each = var.iam.folder_iam_bindings != null ? var.iam.folder_iam_bindings : {}
 
   folder  = each.value.folder_id
   role    = each.value.role
