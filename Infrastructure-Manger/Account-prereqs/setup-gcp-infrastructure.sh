@@ -500,7 +500,7 @@ check_project_resources() {
             "roles/editor"
             "roles/storage.admin"
             "roles/iam.serviceAccountUser"
-            "roles/config.agent"
+            "roles/config.admin"
             "roles/iam.securityAdmin"
             "roles/iam.serviceAccountAdmin"
         )
@@ -837,7 +837,7 @@ for FOLDER in "${FOLDERS[@]}"; do
                                 "roles/editor"
                                 "roles/storage.admin"
                                 "roles/iam.serviceAccountUser"
-                                "roles/config.agent"
+                                "roles/config.admin"
                                 "roles/iam.securityAdmin"
                                 "roles/iam.serviceAccountAdmin"
                             )
@@ -1369,7 +1369,7 @@ for FOLDER in "${FOLDERS[@]}"; do
                 "roles/editor"
                 "roles/storage.admin"
                 "roles/iam.serviceAccountUser"
-                "roles/config.agent"
+                "roles/config.admin"
                 "roles/iam.securityAdmin"
                 "roles/iam.serviceAccountAdmin"
             )
