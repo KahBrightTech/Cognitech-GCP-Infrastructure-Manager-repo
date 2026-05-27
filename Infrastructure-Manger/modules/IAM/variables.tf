@@ -1,5 +1,19 @@
 # GCP IAM Module - Variables
 
+variable "common" {
+  description = "Common configuration used across modules"
+  type = object({
+    project_id = optional(string)
+    region     = optional(string)
+    labels     = optional(map(string))
+  })
+  default = {
+    project_id = ""
+    region     = "us-central1"
+    labels     = {}
+  }
+}
+
 variable "iam" {
   description = "IAM configuration for GCP resources including project, organization, folders, custom roles, and service accounts"
   type = object({

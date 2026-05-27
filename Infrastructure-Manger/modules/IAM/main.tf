@@ -2,11 +2,15 @@
 # This module manages IAM resources including project IAM bindings, 
 # custom roles, and service accounts
 
+locals {
+  effective_project_id = trimspace(var.iam.project_id) != "" ? var.iam.project_id : var.common.project_id
+}
+
 # Project IAM Bindings
 resource "google_project_iam_binding" "project_bindings" {
   for_each = var.iam.project_iam_bindings != null ? var.iam.project_iam_bindings : {}
 
-  project = var.iam.project_id
+  project = local.effective_project_id
   role    = each.key
   members = each.value
 
@@ -24,7 +28,7 @@ resource "google_project_iam_binding" "project_bindings" {
 resource "google_project_iam_member" "project_members" {
   for_each = var.iam.project_iam_members != null ? var.iam.project_iam_members : {}
 
-  project = var.iam.project_id
+  project = local.effective_project_id
   role    = each.value.role
   member  = each.value.member
 
@@ -42,7 +46,7 @@ resource "google_project_iam_member" "project_members" {
 resource "google_project_iam_custom_role" "custom_roles" {
   for_each = var.iam.custom_roles != null ? var.iam.custom_roles : {}
 
-  project     = var.iam.project_id
+  project     = local.effective_project_id
   role_id     = each.key
   title       = each.value.title
   description = each.value.description
@@ -54,7 +58,7 @@ resource "google_project_iam_custom_role" "custom_roles" {
 resource "google_service_account" "service_accounts" {
   for_each = var.iam.service_accounts != null ? var.iam.service_accounts : {}
 
-  project      = var.iam.project_id
+  project      = local.effective_project_id
   account_id   = each.key
   display_name = each.value.display_name
   description  = lookup(each.value, "description", null)

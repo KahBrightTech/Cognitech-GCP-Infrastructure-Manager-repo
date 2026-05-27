@@ -60,7 +60,7 @@ output "project_iam_bindings" {
 
 output "project_id" {
   description = "The project ID where IAM resources were created"
-  value       = var.iam.project_id
+  value       = local.effective_project_id
 }
 
 output "organization_iam_bindings" {
