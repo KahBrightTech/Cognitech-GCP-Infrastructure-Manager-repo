@@ -63,6 +63,33 @@ function Write-Warning { param($Message) Write-Host "⚠ $Message" -ForegroundCo
 function Write-Error { param($Message) Write-Host "✗ $Message" -ForegroundColor Red }
 function Write-Step { param($Number, $Message) Write-Host "`n[$Number] $Message" -ForegroundColor Magenta }
 
+# ----------------------------------------------------------------------------
+# Human-readable labels for the issue codes used by Check-ProjectResources.
+# Used to give descriptive output instead of bare codes like "versioning".
+# ----------------------------------------------------------------------------
+$script:IssueLabels = @{
+    "billing"               = "Billing account not linked"
+    "apis"                  = "Required APIs not all enabled"
+    "service-account"       = "Infra Manager service account missing"
+    "service-account-roles" = "Service account missing required roles"
+    "bucket"                = "State bucket not found"
+    "versioning"            = "Bucket versioning not enabled"
+    "lifecycle"             = "Lifecycle rule (delete noncurrent after 30d) missing"
+    "wif"                   = "Workload Identity Federation not configured"
+}
+
+function Write-IssueList {
+    param(
+        [string[]]$Issues,
+        [string]$Indent = "        "
+    )
+    Write-Host "$($Indent)⚠️  Issues found:" -ForegroundColor Yellow
+    foreach ($issue in $Issues) {
+        $label = if ($script:IssueLabels.ContainsKey($issue)) { $script:IssueLabels[$issue] } else { $issue }
+        Write-Host "$Indent   • $label" -ForegroundColor Yellow
+    }
+}
+
 # Header
 Clear-Host
 Write-Host @"
@@ -407,6 +434,186 @@ function Invoke-WithRetry {
 }
 
 # ----------------------------------------------------------------------------
+# Resolve the bare state-bucket name for a project.
+# `gcloud storage buckets list --format="value(name)"` can return either a bare
+# name or a full "projects/_/buckets/NAME" path depending on the SDK version.
+# This strips any prefix so callers always get a usable bucket name for
+# `gs://NAME`. Returns $null if no matching state bucket is found.
+# ----------------------------------------------------------------------------
+function Get-StateBucketName {
+    param([string]$ProjectId)
+
+    $bucketLine = gcloud storage buckets list --project=$ProjectId --format="value(name)" 2>$null |
+        Where-Object { $_ -match "$ProjectId.*state" } |
+        Select-Object -First 1
+
+    if (-not $bucketLine) {
+        return $null
+    }
+
+    # Strip "projects/_/buckets/" or "gs://" prefixes to get the bare name.
+    $bucketName = ($bucketLine -replace '^.*buckets/', '' -replace '^gs://', '').Trim()
+    if ([string]::IsNullOrWhiteSpace($bucketName)) {
+        return $null
+    }
+    return $bucketName
+}
+
+# ----------------------------------------------------------------------------
+# Returns $true if bucket versioning is enabled, $false otherwise.
+# gcloud returns lowercase "true"; normalize and match defensively across
+# possible representations (true / enabled).
+# ----------------------------------------------------------------------------
+function Test-BucketVersioning {
+    param([string]$BucketName)
+
+    # Read the full JSON and check both possible field shapes:
+    #   newer gcloud storage: top-level "versioning_enabled": true
+    #   older / GCS-API style: nested "versioning": { "enabled": true }
+    $raw = gcloud storage buckets describe "gs://$BucketName" --format="json" 2>$null | Out-String
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return $false
+    }
+
+    try {
+        $obj = $raw | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+
+    # newer snake_case field
+    if ($null -ne $obj.versioning_enabled) {
+        return [bool]$obj.versioning_enabled
+    }
+    # older nested field
+    if ($null -ne $obj.versioning -and $null -ne $obj.versioning.enabled) {
+        return [bool]$obj.versioning.enabled
+    }
+
+    return $false
+}
+
+# ----------------------------------------------------------------------------
+# Returns $true if the bucket has a Delete lifecycle rule targeting noncurrent
+# versions at 30 days. Tolerant of string/int typing and action-type casing.
+# ----------------------------------------------------------------------------
+function Test-BucketLifecycle {
+    param([string]$BucketName)
+
+    $lifecycleRaw = gcloud storage buckets describe "gs://$BucketName" --format="json" 2>$null | Out-String
+    if ([string]::IsNullOrWhiteSpace($lifecycleRaw)) {
+        return $false
+    }
+
+    try {
+        $lifecycleObj = $lifecycleRaw | ConvertFrom-Json
+    } catch {
+        # Parse failure -> treat as missing so it gets (re)applied.
+        return $false
+    }
+
+    # Field name varies by gcloud version:
+    #   newer gcloud storage: "lifecycle_config": { "rule": [...] }
+    #   older / GCS-API style: "lifecycle": { "rule": [...] }
+    $rules = $null
+    if ($lifecycleObj.lifecycle_config -and $lifecycleObj.lifecycle_config.rule) {
+        $rules = $lifecycleObj.lifecycle_config.rule
+    } elseif ($lifecycleObj.lifecycle -and $lifecycleObj.lifecycle.rule) {
+        $rules = $lifecycleObj.lifecycle.rule
+    }
+
+    foreach ($rule in @($rules)) {
+        $actionType = "$($rule.action.type)"
+        $days = $rule.condition.daysSinceNoncurrentTime
+        if ($actionType -ieq "Delete" -and $null -ne $days -and [int]$days -eq 30) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# ----------------------------------------------------------------------------
+# Apply versioning to a bucket with retry. Returns $true on success.
+# ----------------------------------------------------------------------------
+function Set-BucketVersioning {
+    param([string]$BucketName)
+
+    $success = $false
+    $retries = 0
+    $maxRetries = 3
+
+    while (-not $success -and $retries -lt $maxRetries) {
+        gcloud storage buckets update "gs://$BucketName" --versioning 2>&1 | Out-Null
+
+        if ($LASTEXITCODE -eq 0 -and (Test-BucketVersioning -BucketName $BucketName)) {
+            Write-Success "Versioning enabled (verified)"
+            $success = $true
+        } else {
+            $retries++
+            if ($retries -lt $maxRetries) {
+                Write-Warning "Versioning not confirmed yet (attempt $retries/$maxRetries). Retrying in 5 seconds..."
+                Start-Sleep -Seconds 5
+            } else {
+                Write-Warning "Failed to confirm versioning after $maxRetries attempts"
+                Write-Info "Verify manually: gcloud storage buckets describe gs://$BucketName --format='value(versioning.enabled)'"
+            }
+        }
+    }
+    return $success
+}
+
+# ----------------------------------------------------------------------------
+# Apply the noncurrent-delete lifecycle rule to a bucket with retry, then
+# verify it actually took. Returns $true on success.
+# Note: the lifecycle JSON is kept symmetric with what Test-BucketLifecycle
+# checks for (no empty matchesPrefix, which GCS strips on storage anyway).
+# ----------------------------------------------------------------------------
+function Set-BucketLifecycle {
+    param([string]$BucketName)
+
+    $lifecycleConfig = @"
+{
+  "lifecycle": {
+    "rule": [
+      {
+        "action": { "type": "Delete" },
+        "condition": { "daysSinceNoncurrentTime": 30 }
+      }
+    ]
+  }
+}
+"@
+
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    $lifecycleConfig | Out-File -FilePath $tempFile -Encoding UTF8
+
+    $success = $false
+    $retries = 0
+    $maxRetries = 3
+
+    while (-not $success -and $retries -lt $maxRetries) {
+        gcloud storage buckets update "gs://$BucketName" --lifecycle-file=$tempFile 2>&1 | Out-Null
+
+        if ($LASTEXITCODE -eq 0 -and (Test-BucketLifecycle -BucketName $BucketName)) {
+            Write-Success "Lifecycle rule applied and verified (delete noncurrent after 30 days)"
+            $success = $true
+        } else {
+            $retries++
+            if ($retries -lt $maxRetries) {
+                Write-Warning "Lifecycle rule not confirmed yet (attempt $retries/$maxRetries). Retrying in 5 seconds..."
+                Start-Sleep -Seconds 5
+            } else {
+                Write-Warning "Failed to confirm lifecycle rule after $maxRetries attempts"
+                Write-Info "Verify manually: gcloud storage buckets describe gs://$BucketName --format=json"
+            }
+        }
+    }
+
+    Remove-Item $tempFile -ErrorAction SilentlyContinue
+    return $success
+}
+
+# ----------------------------------------------------------------------------
 # Configure the GitHub OIDC Workload Identity Provider.
 # Creates the provider if missing (with the required attribute-condition),
 # or updates an existing provider to ensure the condition is present.
@@ -582,8 +789,12 @@ function Check-ProjectResources {
     if (-not $saExists) {
         $issues += "service-account"
     } else {
-        # Check if service account has required roles
-        $saRoles = gcloud projects get-iam-policy $ProjectId --flatten="bindings[].members" --filter="bindings.members:serviceAccount:$saEmail" --format="value(bindings.role)" 2>$null
+        # Check if service account has required roles.
+        # Normalize returned roles (trim whitespace, drop blanks) before comparing,
+        # since gcloud output can include stray whitespace/empty lines that break
+        # an exact -contains match and cause false "missing roles" reports.
+        $saRolesRaw = gcloud projects get-iam-policy $ProjectId --flatten="bindings[].members" --filter="bindings.members:serviceAccount:$saEmail" --format="value(bindings.role)" 2>$null
+        $saRoles = @($saRolesRaw | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
         $requiredRoles = @(
             "roles/editor",
             "roles/storage.admin",
@@ -592,46 +803,34 @@ function Check-ProjectResources {
             "roles/iam.securityAdmin",
             "roles/iam.serviceAccountAdmin"
         )
+        $missingRoles = @()
         foreach ($role in $requiredRoles) {
             if ($saRoles -notcontains $role) {
-                $issues += "service-account-roles"
-                break
+                $missingRoles += $role
             }
+        }
+        if ($missingRoles.Count -gt 0) {
+            $issues += "service-account-roles"
+            # Stash the specific missing roles for clearer reporting.
+            $script:LastMissingRoles = $missingRoles
         }
     }
     
-    # Check for state bucket
-    $buckets = gcloud storage buckets list --project=$ProjectId --format="value(name)" 2>$null | Where-Object { $_ -match "$ProjectId.*state" }
+    # ---- State bucket discovery (bare name) ----
+    # Uses Get-StateBucketName to strip any "projects/_/buckets/" prefix so the
+    # versioning/lifecycle checks below run against a valid gs:// URL.
+    $bucketName = Get-StateBucketName -ProjectId $ProjectId
     
-    if (-not $buckets) {
+    if (-not $bucketName) {
         $issues += "bucket"
     } else {
-        $bucketName = $buckets | Select-Object -First 1
-        
-        # Check versioning is enabled
-        $versioning = gcloud storage buckets describe "gs://$bucketName" --format="value(versioning.enabled)" 2>$null
-        if ($versioning -ne "True") {
+        # ---- Versioning ----
+        if (-not (Test-BucketVersioning -BucketName $bucketName)) {
             $issues += "versioning"
         }
         
-        # Check lifecycle has correct rule: Delete action with 30 days since noncurrent
-        $lifecycleRaw = gcloud storage buckets describe "gs://$bucketName" --format="json" 2>$null
-        $hasCorrectLifecycle = $false
-        
-        if ($lifecycleRaw) {
-            $lifecycleObj = $lifecycleRaw | ConvertFrom-Json
-            if ($lifecycleObj.lifecycle -and $lifecycleObj.lifecycle.rule) {
-                # Check if any rule has Delete action with daysSinceNoncurrentTime = 30
-                foreach ($rule in $lifecycleObj.lifecycle.rule) {
-                    if ($rule.action.type -eq "Delete" -and $rule.condition.daysSinceNoncurrentTime -eq 30) {
-                        $hasCorrectLifecycle = $true
-                        break
-                    }
-                }
-            }
-        }
-        
-        if (-not $hasCorrectLifecycle) {
+        # ---- Lifecycle ----
+        if (-not (Test-BucketLifecycle -BucketName $bucketName)) {
             $issues += "lifecycle"
         }
     }
@@ -653,7 +852,7 @@ function Check-ProjectResources {
     return [PSCustomObject]@{
         ProjectId = $ProjectId
         Issues = $issues
-        BucketName = if ($buckets) { $buckets | Select-Object -First 1 } else { $null }
+        BucketName = $bucketName
         ServiceAccount = $saEmail
     }
 }
@@ -810,7 +1009,7 @@ foreach ($folder in $folders) {
                 
                 if ($validation.Issues.Count -gt 0) {
                     $projectsWithIssues += $validation
-                    Write-Host "        ⚠️  Missing: $($validation.Issues -join ', ')" -ForegroundColor Yellow
+                    Write-IssueList -Issues $validation.Issues
                 } else {
                     Write-Host "        ✓ Complete" -ForegroundColor Green
                 }
@@ -825,6 +1024,7 @@ foreach ($folder in $folders) {
                 if ($fixMissing -eq 'y') {
                     foreach ($projValidation in $projectsWithIssues) {
                         Write-Info "`nFixing resources for: $($projValidation.ProjectId)"
+                        Write-IssueList -Issues $projValidation.Issues -Indent "  "
                         
                         # Fix billing
                         if ($projValidation.Issues -contains "billing") {
@@ -952,71 +1152,16 @@ foreach ($folder in $folders) {
                             }
                         }
                         
-                        # Fix versioning
+                        # Fix versioning (verified inside Set-BucketVersioning)
                         if ($projValidation.Issues -contains "versioning" -and $projValidation.BucketName) {
                             Write-Info "Enabling versioning on $($projValidation.BucketName)..."
-                            $versioningSuccess = $false
-                            $versioningRetries = 0
-                            $maxVersioningRetries = 3
-                            
-                            while (-not $versioningSuccess -and $versioningRetries -lt $maxVersioningRetries) {
-                                $versioningResult = gcloud storage buckets update "gs://$($projValidation.BucketName)" --versioning 2>&1
-                                
-                                if ($LASTEXITCODE -eq 0) {
-                                    Write-Success "Versioning enabled"
-                                    $versioningSuccess = $true
-                                } else {
-                                    $versioningRetries++
-                                    if ($versioningRetries -lt $maxVersioningRetries) {
-                                        Write-Warning "Retry in 5 seconds (attempt $versioningRetries/$maxVersioningRetries)..."
-                                        Start-Sleep -Seconds 5
-                                    } else {
-                                        Write-Warning "Failed to enable versioning after $maxVersioningRetries attempts"
-                                    }
-                                }
-                            }
+                            Set-BucketVersioning -BucketName $projValidation.BucketName | Out-Null
                         }
                         
-                        # Fix lifecycle
+                        # Fix lifecycle (verified inside Set-BucketLifecycle)
                         if ($projValidation.Issues -contains "lifecycle" -and $projValidation.BucketName) {
-                            Write-Info "Adding lifecycle rule..."
-                            $lifecycleConfig = @"
-{
-  "lifecycle": {
-    "rule": [
-      {
-        "action": {"type": "Delete"},
-        "condition": {"daysSinceNoncurrentTime": 30}
-      }
-    ]
-  }
-}
-"@
-                            $tempFile = [System.IO.Path]::GetTempFileName()
-                            $lifecycleConfig | Set-Content -Path $tempFile
-                            
-                            $lifecycleSuccess = $false
-                            $lifecycleRetries = 0
-                            $maxLifecycleRetries = 3
-                            
-                            while (-not $lifecycleSuccess -and $lifecycleRetries -lt $maxLifecycleRetries) {
-                                $lifecycleResult = gcloud storage buckets update "gs://$($projValidation.BucketName)" --lifecycle-file=$tempFile 2>&1
-                                
-                                if ($LASTEXITCODE -eq 0) {
-                                    Write-Success "Lifecycle rule applied"
-                                    $lifecycleSuccess = $true
-                                } else {
-                                    $lifecycleRetries++
-                                    if ($lifecycleRetries -lt $maxLifecycleRetries) {
-                                        Write-Warning "Retry in 5 seconds (attempt $lifecycleRetries/$maxLifecycleRetries)..."
-                                        Start-Sleep -Seconds 5
-                                    } else {
-                                        Write-Warning "Failed to apply lifecycle rule after $maxLifecycleRetries attempts"
-                                    }
-                                }
-                            }
-                            
-                            Remove-Item $tempFile -ErrorAction SilentlyContinue
+                            Write-Info "Adding lifecycle rule on $($projValidation.BucketName)..."
+                            Set-BucketLifecycle -BucketName $projValidation.BucketName | Out-Null
                         }
                         
                         # Fix Workload Identity Federation
@@ -1493,76 +1638,13 @@ foreach ($folder in $folders) {
             Write-Info "Waiting for bucket to be ready..."
             Start-Sleep -Seconds 10
             
-            # Enable versioning with retry logic
+            # Enable versioning (Set-BucketVersioning verifies and retries internally)
             Write-Info "Enabling versioning on bucket..."
-            $versioningSuccess = $false
-            $versioningRetries = 0
-            $maxVersioningRetries = 3
+            Set-BucketVersioning -BucketName $bucketName | Out-Null
             
-            while (-not $versioningSuccess -and $versioningRetries -lt $maxVersioningRetries) {
-                $versioningResult = gcloud storage buckets update "gs://$bucketName" --versioning 2>&1
-                
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Success "Versioning enabled"
-                    $versioningSuccess = $true
-                } else {
-                    $versioningRetries++
-                    if ($versioningRetries -lt $maxVersioningRetries) {
-                        Write-Warning "Versioning failed (attempt $versioningRetries/$maxVersioningRetries). Retrying in 5 seconds..."
-                        Start-Sleep -Seconds 5
-                    } else {
-                        Write-Warning "Failed to enable versioning after $maxVersioningRetries attempts: $versioningResult"
-                        Write-Warning "You can enable it manually: gcloud storage buckets update gs://$bucketName --versioning"
-                    }
-                }
-            }
-            
-            # Add lifecycle rule to manage old versions (cost optimization)
+            # Apply lifecycle rule (Set-BucketLifecycle verifies and retries internally)
             Write-Info "Adding lifecycle rule to delete old versions after 30 days..."
-            $lifecycleConfig = @"
-{
-  "lifecycle": {
-    "rule": [
-      {
-        "action": {
-          "type": "Delete"
-        },
-        "condition": {
-          "daysSinceNoncurrentTime": 30,
-          "matchesPrefix": []
-        }
-      }
-    ]
-  }
-}
-"@
-            
-            $tempFile = [System.IO.Path]::GetTempFileName()
-            $lifecycleConfig | Out-File -FilePath $tempFile -Encoding UTF8
-            
-            $lifecycleSuccess = $false
-            $lifecycleRetries = 0
-            $maxLifecycleRetries = 3
-            
-            while (-not $lifecycleSuccess -and $lifecycleRetries -lt $maxLifecycleRetries) {
-                $lifecycleResult = gcloud storage buckets update "gs://$bucketName" --lifecycle-file=$tempFile 2>&1
-                
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Success "Lifecycle rule applied (old versions deleted after 30 days)"
-                    $lifecycleSuccess = $true
-                } else {
-                    $lifecycleRetries++
-                    if ($lifecycleRetries -lt $maxLifecycleRetries) {
-                        Write-Warning "Lifecycle rule failed (attempt $lifecycleRetries/$maxLifecycleRetries). Retrying in 5 seconds..."
-                        Start-Sleep -Seconds 5
-                    } else {
-                        Write-Warning "Failed to apply lifecycle rule after $maxLifecycleRetries attempts: $lifecycleResult"
-                        Write-Info "Bucket will keep all versions indefinitely (may increase costs)"
-                    }
-                }
-            }
-            
-            Remove-Item $tempFile -ErrorAction SilentlyContinue
+            Set-BucketLifecycle -BucketName $bucketName | Out-Null
             
             $createdResources += [PSCustomObject]@{
                 Folder = $folder
