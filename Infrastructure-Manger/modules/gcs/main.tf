@@ -9,7 +9,7 @@ locals {
   bucket_iam_bindings = {
     for item in flatten([
       for bucket_key, bucket in local.effective_buckets : [
-        for role, members in lookup(bucket, "iam_bindings", {}) : {
+        for role, members in coalesce(lookup(bucket, "iam_bindings", {}), {}) : {
           key        = "${bucket_key}|${role}"
           bucket_key = bucket_key
           role       = role
@@ -22,7 +22,7 @@ locals {
   bucket_iam_members = {
     for item in flatten([
       for bucket_key, bucket in local.effective_buckets : [
-        for member_key, member in lookup(bucket, "iam_members", {}) : {
+        for member_key, member in coalesce(lookup(bucket, "iam_members", {}), {}) : {
           key        = "${bucket_key}|${member_key}"
           bucket_key = bucket_key
           role       = member.role
@@ -41,7 +41,7 @@ resource "google_storage_bucket" "buckets" {
   name                        = each.value.name
   location                    = local.effective_location
   storage_class               = lookup(each.value, "storage_class", "STANDARD")
-  labels                      = merge(local.common_labels, lookup(each.value, "labels", {}))
+  labels                      = merge(local.common_labels, coalesce(lookup(each.value, "labels", {}), {}))
   force_destroy               = lookup(each.value, "force_destroy", false)
   uniform_bucket_level_access = lookup(each.value, "uniform_bucket_level_access", true)
   public_access_prevention    = lookup(each.value, "public_access_prevention", "enforced")
@@ -59,7 +59,7 @@ resource "google_storage_bucket" "buckets" {
   }
 
   dynamic "lifecycle_rule" {
-    for_each = lookup(each.value, "lifecycle_rules", [])
+    for_each = coalesce(lookup(each.value, "lifecycle_rules", []), [])
     content {
       action {
         type          = lifecycle_rule.value.action_type
