@@ -1,13 +1,14 @@
 # GCP Storage (S3-equivalent) Module - Main Configuration
 
 locals {
+  effective_buckets    = coalesce(var.s3.buckets, {})
   effective_project_id = trimspace(var.s3.project_id) != "" ? var.s3.project_id : var.common.project_id
   effective_location   = try(trimspace(var.s3.location), "") != "" ? var.s3.location : var.common.region
-  common_labels        = var.common.labels
+  common_labels        = coalesce(var.common.labels, {})
 
   bucket_iam_bindings = {
     for item in flatten([
-      for bucket_key, bucket in var.s3.buckets : [
+      for bucket_key, bucket in local.effective_buckets : [
         for role, members in lookup(bucket, "iam_bindings", {}) : {
           key        = "${bucket_key}|${role}"
           bucket_key = bucket_key
@@ -20,7 +21,7 @@ locals {
 
   bucket_iam_members = {
     for item in flatten([
-      for bucket_key, bucket in var.s3.buckets : [
+      for bucket_key, bucket in local.effective_buckets : [
         for member_key, member in lookup(bucket, "iam_members", {}) : {
           key        = "${bucket_key}|${member_key}"
           bucket_key = bucket_key
@@ -34,7 +35,7 @@ locals {
 }
 
 resource "google_storage_bucket" "buckets" {
-  for_each = var.s3.buckets
+  for_each = local.effective_buckets
 
   project                     = local.effective_project_id
   name                        = each.value.name

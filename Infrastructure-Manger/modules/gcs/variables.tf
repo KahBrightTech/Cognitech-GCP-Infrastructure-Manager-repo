@@ -3,9 +3,9 @@
 variable "common" {
   description = "Common configuration used across modules"
   type = object({
-    project_id = optional(string)
-    region     = optional(string)
-    labels     = optional(map(string))
+    project_id = optional(string, "")
+    region     = optional(string, "us-central1")
+    labels     = optional(map(string), {})
   })
   default = {
     project_id = ""
@@ -18,7 +18,7 @@ variable "s3" {
   description = "Cloud Storage configuration including project, location, buckets, and IAM"
   type = object({
     project_id = string
-    location   = optional(string)
+    location   = optional(string, "us-central1")
 
     buckets = optional(map(object({
       name                        = string
@@ -50,7 +50,7 @@ variable "s3" {
         matches_suffix             = optional(list(string))
       })))
 
-      iam_bindings = optional(map(list(string)))
+      iam_bindings = optional(map(list(string)), {})
       iam_members = optional(map(object({
         role   = string
         member = string
@@ -59,8 +59,8 @@ variable "s3" {
           description = string
           expression  = string
         }))
-      })))
-    })))
+      })), {})
+    })), {})
   })
 
   default = {
